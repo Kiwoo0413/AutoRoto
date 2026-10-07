@@ -7,41 +7,75 @@ Uses PyTorch + CUDA (NVIDIA GeForce RTX 4080) for bidirectional zero-drift track
 import os
 import sys
 import json
+import shutil
 import subprocess
 import tempfile
 from typing import List, Dict, Any, Tuple, Optional
 
-# Default discovered Python executable with PyTorch & CUDA
-KNOWN_AI_PYTHONS = [
-    r"C:\Users\yido2\AppData\Local\Programs\Python\Python312\python.exe",
-    "python",
-    "python3"
-]
-
-def find_ai_python(custom_path: Optional[str] = None) -> Optional[str]:
-    """
-    Locates Python interpreter with PyTorch and CUDA support.
-    """
+def get_candidate_pythons(custom_path: Optional[str] = None) -> List[str]:
     candidates = []
     if custom_path and os.path.exists(custom_path.strip()):
         candidates.append(custom_path.strip())
 
-    candidates.extend(KNOWN_AI_PYTHONS)
+    # 1. Dedicated Environment Variable
+    env_py = os.environ.get("AUTOROTO_PYTHON")
+    if env_py and os.path.isfile(env_py):
+        candidates.append(env_py)
+
+    # 2. Dynamic User Directories (Windows, Conda, Python.org)
+    user_home = os.path.expanduser("~")
+    common_relative = [
+        r"AppData\Local\Programs\Python\Python312\python.exe",
+        r"AppData\Local\Programs\Python\Python311\python.exe",
+        r"AppData\Local\Programs\Python\Python310\python.exe",
+        r"miniconda3\python.exe",
+        r"anaconda3\python.exe",
+        r"miniconda3\envs\autoroto\python.exe",
+        r"anaconda3\envs\autoroto\python.exe",
+        "miniconda3/bin/python",
+        "anaconda3/bin/python",
+    ]
+    for rel in common_relative:
+        p = os.path.join(user_home, rel)
+        if os.path.isfile(p) and p not in candidates:
+            candidates.append(p)
+
+    # 3. System PATH Discovery
+    for cmd in ("python", "python3"):
+        which_p = shutil.which(cmd)
+        if which_p and which_p not in candidates:
+            candidates.append(which_p)
+        if cmd not in candidates:
+            candidates.append(cmd)
+
     if sys.executable not in candidates:
         candidates.append(sys.executable)
+
+    return candidates
+
+
+def find_ai_python(custom_path: Optional[str] = None) -> Optional[str]:
+    """
+    Locates Python interpreter with PyTorch and CUDA support.
+    Prioritizes CUDA-enabled interpreters over CPU fallbacks.
+    """
+    candidates = get_candidate_pythons(custom_path)
+    cpu_fallback = None
 
     for py_exe in candidates:
         if not os.path.isfile(py_exe) and not any(py_exe.startswith(prefix) for prefix in ("python", "python3")):
             continue
         try:
-            cmd = [py_exe, "-c", "import torch; print(torch.cuda.is_available())"]
+            cmd = [py_exe, "-c", "import torch; print('CUDA' if torch.cuda.is_available() else 'CPU')"]
             out = subprocess.check_output(cmd, stderr=subprocess.STDOUT, timeout=6).decode().strip()
-            if "True" in out or "False" in out:
+            if "CUDA" in out:
                 return py_exe
+            elif "CPU" in out and cpu_fallback is None:
+                cpu_fallback = py_exe
         except Exception:
             continue
 
-    return None
+    return cpu_fallback
 
 
 def check_ai_environment(custom_path: Optional[str] = None) -> Dict[str, Any]:

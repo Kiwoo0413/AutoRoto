@@ -14,40 +14,85 @@
 
 ---
 
-## 📁 2. 파일 구성
+## 📥 2. 설치 방법 (Installation)
+
+### 1) GitHub 저장소 다운로드 / 클론
+Nuke의 사용자 플러그인 디렉터리(`~/.nuke/`)에 저장소를 클론하거나 압축 해제합니다:
+```bash
+cd ~/.nuke
+git clone https://github.com/Kiwoo0413/AutoRoto.git
+```
+*(폴더명이 반드시 `AutoRoto`여야 합니다.)*
+
+### 2) Nuke `init.py` 경로 등록
+`~/.nuke/init.py` 파일(없으면 새로 생성)을 열고 아래 1줄을 추가합니다:
+```python
+import nuke
+nuke.pluginAddPath('AutoRoto')
+```
+
+### 3) 외부 Python & AI 백엔드 환경 준비
+AutoRoto는 Nuke 내장 파이썬과 충돌하지 않도록 외부 Python의 PyTorch + CUDA 환경을 사용합니다.
+- **Python 버전**: 3.10 ~ 3.12 (Windows / Linux)
+- **필수 패키지 설치**:
+  ```bash
+  # CUDA 지원 PyTorch 설치 (예: CUDA 12.4)
+  pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
+  pip install numpy Pillow
+  
+  # (선택) CoTracker 패키지 설치 (미설치 시 torch.hub를 통해 모델 자동 로드)
+  pip install git+https://github.com/facebookresearch/co-tracker.git
+  ```
+- *참고*: 가상환경(Conda)이나 특정 경로의 Python을 사용하고 싶다면 시스템 환경 변수 `AUTOROTO_PYTHON`에 해당 `python.exe`의 절대 경로를 지정하시면 우선적으로 인식됩니다.
+
+---
+
+## 📁 3. 파일 구성
 
 ```text
-c:\Users\yido2\.nuke\AutoRoto\
-├── nuke_bridge.py             # Roto 노드 복제, Tracker 스타일 버튼 탑재, rootLayer 연동 및 베이킹
-├── tracker_core.py            # CoTracker 3 GPU 딥러닝 포인트 트래킹 백엔드 (PyTorch + RTX 4080 CUDA)
-├── roto_ui.py                 # PySide Roto 전용 패널 (트리 뷰 및 세부 제어 지원)
+~/.nuke/AutoRoto/
+├── init.py                    # AutoRoto sys.path 등록
+├── menu.py                    # 메뉴 바, 툴바(Draw/Nodes), 단축키(Ctrl+Alt+R) 등록
+├── nuke_bridge.py             # Nuke Roto 노드 제어, Tab 1 배치, 베지에 탄젠트 복원 및 키프레임 베이킹
+├── tracker_core.py            # CoTracker 3 GPU 딥러닝 트래커 (100프레임 청크, 실시간 스트리밍, 다운스케일)
+├── roto_ui.py                 # 독립형 PySide 패널 UI
 ├── main.py                    # 패널 런처
-├── menu.py                    # Nuke 툴바, 노드 메뉴, 단축키 (Ctrl+Alt+R) 등록
-├── init.py                    # 패키지 sys.path 초기화
-├── test_cotracker_backend.py  # 단위 테스트 스위트 (100% 통과)
-└── README.md                  # 설명서
+├── test_cotracker_backend.py  # 단위 테스트 스위트
+├── test_tangent_math.py       # 탄젠트 수학 및 키 스텝 검증 테스트
+├── README.md                  # 사용자 매뉴얼
+└── SCRIPT_STRUCTURE.md        # 아키텍처 및 내부 구조 상세 문서
 ```
 
 ---
 
-## 🖥️ 3. 사용 방법 (Nuke)
+## 🖥️ 4. 사용 방법 (Nuke)
 
 ### 방법 A: AutoRoto 노드 신규 생성 (권장)
 1. **노드 생성**:
    - 노드 그래프에서 `Tab` 키를 누르고 **`AutoRoto`** 입력 (또는 단축키 **`Ctrl+Alt+R`**, 또는 노드 툴바의 **AutoRoto** 아이콘 클릭).
    - 생성되는 노드는 **100% 네이티브 Roto 노드**이므로 뷰어의 모든 펜/베지어 툴이 그대로 동작합니다.
-2. **트래커 탭 확인**:
-   - 노드 프로퍼티 창의 **`AutoRoto Tracker`** 탭을 클릭하면 트래커 노드와 동일한 버튼들이 배치되어 있습니다:
+2. **트래커 탭 (Tab 1) 확인**:
+   - 노드를 더블클릭하면 **`AutoRoto` 탭이 1번 탭으로 자동 배치**되어 나타납니다:
      - `|◀` : 기준 프레임부터 시작 프레임까지 역방향 트래킹
-     - `◀` : 1프레임 뒤로 스텝 트래킹
-     - `▶` : 1프레임 앞으로 스텝 트래킹
+     - `◀` : 1스텝 뒤로 트래킹 (`Key Step` 간격 이동)
+     - `▶` : 1스텝 앞으로 트래킹 (`Key Step` 간격 이동)
      - `▶|` : 기준 프레임부터 끝 프레임까지 순방향 트래킹
-     - **`🚀 Track Full Range`** : 지정한 전체 구간(Start ~ End)을 CoTracker GPU로 일괄 추적 후 자동 베이크
-3. **로토 작성 후 트래킹**:
+     - **`🚀 Track Full Range`** : 지정한 전체 구간을 CoTracker GPU로 일괄 추적 후 자동 베이크
+3. **주요 파라미터**:
+   - **`Ref Frame` / `Set Current`**: 셰이프를 직접 그린 기준 프레임 설정.
+   - **`Key Step`**: 키프레임 생성 간격 (1 = 매 프레임, 2 = 2프레임마다, 5 = 5프레임마다 베이킹하여 편집 용이).
+   - **`Tracking Res`**:
+     - `720p (Fast / AI Optimized)` *(기본값)*: 3~5배 고속 추론 & 서브픽셀 원본 좌표 무손실 복원.
+     - `960p (Balanced)`: 고화질 균형 모드.
+     - `Full (Original / Slow)`: 원본 해상도 유지 모드.
+   - **`Preserve Curvature / Tangents`**: 표면 변형 및 회전에 맞춰 베지에 핸들 곡률을 자연스럽게 보존 (원형 루프 왜곡 방지).
+   - **`Fix / Clean Tangents`**: 꼬인 베지에 핸들이 있을 때 원클릭으로 정돈.
+4. **로토 작성 후 트래킹**:
    - 기준 프레임에서 뷰어에 점을 찍어 로토 셰이프를 완성합니다.
    - **`[Set Current]`**로 기준 프레임을 지정하고 **`[🚀 Track Full Range]`**를 클릭하면 끝!
+   - 실시간 진행률 바를 통해 청크별 진행 상황이 표시되며, 언제든 `Cancel`로 안전하게 즉시 중단할 수 있습니다.
 
 ### 방법 B: 기존에 작업 중이던 Roto 노드에 트래커 버튼 추가
 - 이미 셰이프를 따 둔 일반 Roto 노드가 있다면:
   - 해당 Roto 노드를 선택하고 Nuke 상단 메뉴: **`AutoRoto` ➔ `Convert Selected Roto to AutoRoto`** 클릭.
-  - 기존 셰이프와 점을 그대로 유지한 채 트래커 버튼 탭이 즉시 추가됩니다.
+  - 기존 셰이프와 점을 그대로 유지한 채 1번 탭에 AutoRoto 트래커 기능이 즉시 추가됩니다.
