@@ -97,6 +97,26 @@ from PIL import Image
 import numpy as np
 import torch
 
+def emit_progress(percent: float, message: str):
+    payload = json.dumps({"type": "progress", "percent": round(float(percent), 1), "message": str(message)})
+    print(f"PROGRESS:{payload}", flush=True)
+
+def load_frame_array(path, max_size):
+    img = Image.open(path).convert("RGB")
+    orig_w, orig_h = img.size
+    if max_size > 0 and max(orig_w, orig_h) > max_size:
+        scale = float(max_size) / float(max(orig_w, orig_h))
+        new_w = max(1, int(round(orig_w * scale)))
+        new_h = max(1, int(round(orig_h * scale)))
+        img_resized = img.resize((new_w, new_h), Image.Resampling.BILINEAR)
+        scale_x = float(new_w) / float(orig_w)
+        scale_y = float(new_h) / float(orig_h)
+        arr = np.array(img_resized, dtype=np.float32)
+        return arr, orig_w, orig_h, scale_x, scale_y
+    else:
+        arr = np.array(img, dtype=np.float32)
+        return arr, orig_w, orig_h, 1.0, 1.0
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=str, required=True)
@@ -109,35 +129,21 @@ def main():
     queries_input = cfg["queries"]  # [{"index": 0, "t": rel_f, "x": x_nuke, "y": y_nuke}, ...]
     start_frame = cfg["start_frame"]
     output_path = cfg["output_path"]
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    max_size = int(cfg.get("max_size", 720))
+    chunk_size = int(cfg.get("chunk_size", 100))
     model_name = cfg.get("model", "cotracker3_offline")
+    device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    # 1. Load Image Frames
-    frames = []
-    h, w = 0, 0
-    for p in image_paths:
-        img = Image.open(p).convert("RGB")
-        arr = np.array(img, dtype=np.float32)
-        h, w = arr.shape[0], arr.shape[1]
-        frames.append(arr)
+    total_frames = len(image_paths)
+    if total_frames == 0 or not queries_input:
+        with open(output_path, "w", encoding="utf-8") as f:
+            json.dump({"status": "success", "tracks": {}}, f)
+        return
 
-    # Tensor: (1, T, 3, H, W)
-    video_tensor = torch.from_numpy(np.stack(frames, axis=0))
-    video_tensor = video_tensor.permute(0, 3, 1, 2).unsqueeze(0).to(device)
+    emit_progress(5.0, f"Initializing AI runtime on {device.upper()}...")
 
-    # 2. Convert Queries (Nuke bottom-left -> Image top-left)
-    queries = []
-    for q in queries_input:
-        t_rel = float(q["t"])
-        x_nuke = float(q["x"])
-        y_nuke = float(q["y"])
-        y_img = max(0.0, min(float(h - 1), float(h - 1) - y_nuke))
-        queries.append((t_rel, x_nuke, y_img))
-
-    # queries shape: (1, N, 3)
-    queries_tensor = torch.tensor(queries, dtype=torch.float32, device=device).unsqueeze(0)
-
-    # 3. Load CoTracker Model & Run Inference
+    # Load CoTracker Model
+    emit_progress(10.0, "Loading CoTracker 3 model weights into GPU VRAM...")
     try:
         import cotracker
         if hasattr(cotracker, "build_cotracker"):
@@ -146,39 +152,157 @@ def main():
             model = torch.hub.load("facebookresearch/co-tracker", model_name).to(device)
     except Exception:
         model = torch.hub.load("facebookresearch/co-tracker", model_name).to(device)
+    model.eval()
 
-    with torch.no_grad():
-        pred_tracks, pred_vis = model(video_tensor, queries=queries_tensor, backward_tracking=True)
+    emit_progress(20.0, "Model ready. Analyzing sequence and building chunks...")
 
-    pred_tracks = pred_tracks.cpu().numpy()
-    pred_vis = pred_vis.cpu().numpy() if pred_vis is not None else None
+    # Reference frame index in image_paths (relative to start_frame)
+    ref_idx = int(round(float(queries_input[0]["t"])))
+    ref_idx = max(0, min(total_frames - 1, ref_idx))
 
-    T = pred_tracks.shape[1]
-    N = pred_tracks.shape[2]
+    # Read first frame to determine original dimensions and scale factors
+    test_arr, orig_w, orig_h, scale_x, scale_y = load_frame_array(image_paths[0], max_size)
 
-    # 4. Format Output & Convert Back to Nuke Coordinates
-    results = {}
-    for i, q in enumerate(queries_input):
-        idx = q["index"]
-        results[str(idx)] = {}
-        for t_idx in range(T):
-            actual_f = start_frame + t_idx
-            x_img = float(pred_tracks[0, t_idx, i, 0])
-            y_img = float(pred_tracks[0, t_idx, i, 1])
-            vis_val = float(pred_vis[0, t_idx, i]) if pred_vis is not None else 1.0
+    # Convert initial queries from Nuke bottom-left to scaled image top-left
+    initial_scaled_coords = {}
+    for q in queries_input:
+        pt_idx = q["index"]
+        x_nuke = float(q["x"])
+        y_nuke = float(q["y"])
+        x_orig = x_nuke
+        y_orig = max(0.0, min(float(orig_h - 1), float(orig_h - 1) - y_nuke))
+        x_scaled = x_orig * scale_x
+        y_scaled = y_orig * scale_y
+        initial_scaled_coords[pt_idx] = (x_scaled, y_scaled)
 
-            # Convert to Nuke bottom-left
-            x_nuke = x_img
-            y_nuke = float(h - 1) - y_img
+    # Dictionary to collect all results:
+    tracked_scaled_results = {q["index"]: {} for q in queries_input}
+    for pt_idx, (sx, sy) in initial_scaled_coords.items():
+        tracked_scaled_results[pt_idx][ref_idx] = (sx, sy, 1.0)
 
-            results[str(idx)][str(actual_f)] = {
+    # Build Chunks Plan
+    chunks_plan = []
+    if total_frames <= chunk_size:
+        chunks_plan.append({"type": "single", "start": 0, "end": total_frames, "query_t": ref_idx, "queries": initial_scaled_coords})
+    else:
+        # Forward chunks from ref_idx to total_frames - 1
+        if ref_idx < total_frames - 1:
+            fwd_cur = ref_idx
+            while fwd_cur < total_frames - 1:
+                fwd_end = min(total_frames, fwd_cur + chunk_size)
+                chunks_plan.append({"type": "forward", "start": fwd_cur, "end": fwd_end})
+                fwd_cur = fwd_end - 1  # 1-frame boundary overlap
+
+        # Backward chunks from ref_idx down to 0
+        if ref_idx > 0:
+            bwd_cur = ref_idx
+            while bwd_cur > 0:
+                bwd_start = max(0, bwd_cur - chunk_size + 1)
+                chunks_plan.append({"type": "backward", "start": bwd_start, "end": bwd_cur + 1})
+                bwd_cur = bwd_start
+
+    total_chunks = len(chunks_plan)
+    res_label = f"{max_size}p downscale" if max_size > 0 else "full res"
+    emit_progress(22.0, f"Tracking {total_frames} frames ({res_label}) across {total_chunks} chunk(s)...")
+
+    # Execute Chunks
+    for c_i, plan in enumerate(chunks_plan):
+        c_num = c_i + 1
+        p_base = 22.0 + (float(c_i) / float(total_chunks)) * 68.0
+        p_step = 68.0 / float(total_chunks)
+
+        s_idx = plan["start"]
+        e_idx = plan["end"]
+        L = e_idx - s_idx
+        chunk_paths = image_paths[s_idx:e_idx]
+
+        f_start_label = start_frame + s_idx
+        f_end_label = start_frame + e_idx - 1
+        emit_progress(p_base + p_step * 0.1, f"Chunk {c_num}/{total_chunks}: Loading {L} frames ({f_start_label} - {f_end_label})...")
+
+        # Load and stack frames for this chunk
+        chunk_frames = []
+        for p in chunk_paths:
+            f_arr, _, _, _, _ = load_frame_array(p, max_size)
+            chunk_frames.append(f_arr)
+
+        video_chunk = torch.from_numpy(np.stack(chunk_frames, axis=0))
+        video_chunk = video_chunk.permute(0, 3, 1, 2).unsqueeze(0).to(device)
+
+        pt_indices = [q["index"] for q in queries_input]
+        queries_tensor_list = []
+
+        if plan["type"] == "single":
+            q_t = float(plan["query_t"])
+            for pt_idx in pt_indices:
+                qx, qy = plan["queries"][pt_idx]
+                queries_tensor_list.append((q_t, qx, qy))
+            backward_mode = True
+
+        elif plan["type"] == "forward":
+            q_t = 0.0
+            for pt_idx in pt_indices:
+                qx, qy, _ = tracked_scaled_results[pt_idx][s_idx]
+                queries_tensor_list.append((q_t, qx, qy))
+            backward_mode = False
+
+        elif plan["type"] == "backward":
+            q_t = float(L - 1)
+            anchor_idx = e_idx - 1
+            for pt_idx in pt_indices:
+                qx, qy, _ = tracked_scaled_results[pt_idx][anchor_idx]
+                queries_tensor_list.append((q_t, qx, qy))
+            backward_mode = True
+
+        queries_tensor = torch.tensor(queries_tensor_list, dtype=torch.float32, device=device).unsqueeze(0)
+
+        emit_progress(p_base + p_step * 0.45, f"Chunk {c_num}/{total_chunks}: GPU CoTracker inference on RTX 4080 ({L} frames)...")
+
+        with torch.no_grad():
+            pred_tracks, pred_vis = model(video_chunk, queries=queries_tensor, backward_tracking=backward_mode)
+
+        pred_tracks = pred_tracks.cpu().numpy()
+        pred_vis = pred_vis.cpu().numpy() if pred_vis is not None else None
+
+        # Store predictions
+        for pt_local_i, pt_idx in enumerate(pt_indices):
+            for local_t in range(L):
+                global_frame_idx = s_idx + local_t
+                pred_x = float(pred_tracks[0, local_t, pt_local_i, 0])
+                pred_y = float(pred_tracks[0, local_t, pt_local_i, 1])
+                vis_v = float(pred_vis[0, local_t, pt_local_i]) if pred_vis is not None else 1.0
+                tracked_scaled_results[pt_idx][global_frame_idx] = (pred_x, pred_y, vis_v)
+
+        del video_chunk
+        del queries_tensor
+        if device == "cuda":
+            torch.cuda.empty_cache()
+
+        emit_progress(p_base + p_step * 0.95, f"Chunk {c_num}/{total_chunks} complete ({f_start_label}-{f_end_label}).")
+
+    emit_progress(92.0, "Converting trajectories to Nuke resolution...")
+
+    # Convert all scaled results back to original Nuke coordinates
+    final_output = {}
+    for pt_idx, frames_map in tracked_scaled_results.items():
+        final_output[str(pt_idx)] = {}
+        for f_idx, (sx, sy, vis_val) in frames_map.items():
+            actual_frame = start_frame + f_idx
+            x_orig = sx / scale_x
+            y_orig = sy / scale_y
+            x_nuke = x_orig
+            y_nuke = float(orig_h - 1) - y_orig
+
+            final_output[str(pt_idx)][str(actual_frame)] = {
                 "x": x_nuke,
                 "y": y_nuke,
                 "vis": vis_val
             }
 
     with open(output_path, "w", encoding="utf-8") as f:
-        json.dump({"status": "success", "tracks": results}, f, indent=2)
+        json.dump({"status": "success", "tracks": final_output}, f, indent=2)
+
+    emit_progress(95.0, "Tracking computation complete! Returning data to Nuke.")
 
 if __name__ == "__main__":
     main()
@@ -190,17 +314,14 @@ def run_cotracker_point_tracking(
     start_frame: int,
     custom_python_path: Optional[str] = None,
     model_name: str = "cotracker3_offline",
-    timeout_sec: int = 300
+    max_size: int = 720,
+    chunk_size: int = 100,
+    progress_callback: Optional[Any] = None,
+    timeout_sec: int = 600
 ) -> Dict[int, Dict[int, Tuple[float, float, float]]]:
     """
-    Executes CoTracker 3 offline GPU tracking.
-    queries: List of dicts: [{"index": int, "t": float, "x": float, "y": float}, ...]
-    Returns:
-      {
-         track_idx: {
-             frame: (x, y, visibility)
-         }
-      }
+    Executes CoTracker 3 offline GPU tracking with real-time progress streaming,
+    intelligent downscaling, and 100-frame chunking.
     """
     py_exe = find_ai_python(custom_python_path)
     if not py_exe:
@@ -219,18 +340,45 @@ def run_cotracker_point_tracking(
         "queries": queries,
         "start_frame": start_frame,
         "output_path": output_path,
-        "model": model_name
+        "model": model_name,
+        "max_size": max_size,
+        "chunk_size": chunk_size
     }
 
     with open(config_path, "w", encoding="utf-8") as f:
         json.dump(config_data, f)
 
-    cmd = [py_exe, worker_script, "--config", config_path]
+    cmd = [py_exe, "-u", worker_script, "--config", config_path]
+
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        bufsize=1,
+        encoding="utf-8"
+    )
 
     try:
-        proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=timeout_sec)
+        # Stream stdout line-by-line in real time
+        for line in proc.stdout:
+            line = line.strip()
+            if not line:
+                continue
+            if line.startswith("PROGRESS:"):
+                payload = None
+                try:
+                    payload = json.loads(line[9:])
+                    pct = float(payload.get("percent", 0.0))
+                    msg = str(payload.get("message", ""))
+                except Exception:
+                    payload = None
+                if payload is not None and progress_callback:
+                    progress_callback(pct, msg)
+
+        proc.wait(timeout=timeout_sec)
         if proc.returncode != 0:
-            err = proc.stderr.strip() or proc.stdout.strip()
+            err = proc.stderr.read().strip()
             raise RuntimeError(f"CoTracker worker failed (code {proc.returncode}):\n{err}")
 
         if not os.path.isfile(output_path):
@@ -253,6 +401,11 @@ def run_cotracker_point_tracking(
                 parsed[pt_idx][f_num] = (x, y, vis)
 
         return parsed
+
+    except Exception:
+        if proc.poll() is None:
+            proc.kill()
+        raise
 
     finally:
         try:

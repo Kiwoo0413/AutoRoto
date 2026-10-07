@@ -12,6 +12,15 @@ import shutil
 import tempfile
 from typing import List, Dict, Any, Tuple, Optional
 
+try:
+    from PySide6 import QtWidgets, QtCore
+except ImportError:
+    try:
+        from PySide2 import QtWidgets, QtCore
+    except ImportError:
+        QtWidgets = None
+        QtCore = None
+
 import nuke
 import nuke.rotopaint as rp
 import tracker_core
@@ -201,10 +210,12 @@ class NukeRotoBridge:
         raw_shape,
         tracking_data: Dict[int, Dict[int, Tuple[float, float, float]]],
         ref_frame: int,
-        keep_tangents: bool = True
+        keep_tangents: bool = True,
+        key_step: int = 1
     ) -> bool:
         """
         Bakes CoTracker trajectories into Roto control point animation curves.
+        Supports customizable keyframe interval (key_step) relative to ref_frame.
         Preserves natural curvature and rotates tangents with local shape deformation.
         Never adds center coordinates to relative tangent handles.
         """
@@ -217,6 +228,53 @@ class NukeRotoBridge:
             return False
 
         num_pts = len(pts_info)
+
+        # Gather all tracked frames
+        all_frames = set()
+        for pt_tracks in tracking_data.values():
+            all_frames.update(pt_tracks.keys())
+
+        if not all_frames:
+            return False
+
+        min_f = min(all_frames)
+        max_f = max(all_frames)
+
+        # Compute sparse bake_frames based on key_step anchored at ref_frame
+        key_step = max(1, int(key_step))
+        if key_step == 1:
+            bake_frames = set(all_frames)
+        else:
+            bake_frames = set()
+            bake_frames.add(ref_frame)
+
+            # Step forward from ref_frame
+            f = ref_frame + key_step
+            while f <= max_f:
+                if f in all_frames:
+                    bake_frames.add(f)
+                f += key_step
+            if max_f in all_frames:
+                bake_frames.add(max_f)
+
+            # Step backward from ref_frame
+            f = ref_frame - key_step
+            while f >= min_f:
+                if f in all_frames:
+                    bake_frames.add(f)
+                f -= key_step
+            if min_f in all_frames:
+                bake_frames.add(min_f)
+
+        def _clean_curve_range(curve, start_frame, end_frame, keep_frame):
+            if not curve:
+                return
+            try:
+                keys_to_remove = [k for k in curve.keys() if start_frame <= k.x <= end_frame and int(k.x) != keep_frame]
+                if keys_to_remove:
+                    curve.removeKey(keys_to_remove)
+            except Exception:
+                pass
 
         # Check if shape is open or closed
         is_open = False
@@ -273,6 +331,16 @@ class NukeRotoBridge:
             fc_curve_x = raw_pt.featherCenter.getPositionAnimCurve(0)
             fc_curve_y = raw_pt.featherCenter.getPositionAnimCurve(1)
 
+            if key_step > 1:
+                _clean_curve_range(c_curve_x, min_f, max_f, ref_frame)
+                _clean_curve_range(c_curve_y, min_f, max_f, ref_frame)
+                _clean_curve_range(lt_curve_x, min_f, max_f, ref_frame)
+                _clean_curve_range(lt_curve_y, min_f, max_f, ref_frame)
+                _clean_curve_range(rt_curve_x, min_f, max_f, ref_frame)
+                _clean_curve_range(rt_curve_y, min_f, max_f, ref_frame)
+                _clean_curve_range(fc_curve_x, min_f, max_f, ref_frame)
+                _clean_curve_range(fc_curve_y, min_f, max_f, ref_frame)
+
             prev_i, next_i = neighbors[i]
             p_prev_ref = (pts_info[prev_i]['x'], pts_info[prev_i]['y'])
             p_next_ref = (pts_info[next_i]['x'], pts_info[next_i]['y'])
@@ -281,6 +349,9 @@ class NukeRotoBridge:
             L0 = (v0_x**2 + v0_y**2) ** 0.5
 
             for f, val in tracking_data[i].items():
+                if f not in bake_frames:
+                    continue
+
                 tx = float(val[0])
                 ty = float(val[1])
 
@@ -387,21 +458,162 @@ def get_target_shape(roto_node):
     return shapes[0] if shapes else None
 
 
+def hide_intermediate_native_tabs(node):
+    """
+    Hides intermediate native tabs (Transform, Motion Blur, Shape, Clone, Lifetime, Tracking)
+    so that AutoRoto sits cleanly as the second tab immediately following Roto.
+    """
+    native_tabs = {'transform', 'motion blur', 'shape', 'clone', 'lifetime', 'tracking'}
+    for k in node.allKnobs():
+        if isinstance(k, nuke.Tab_Knob):
+            n_low = (k.name() or '').lower()
+            l_low = (k.label() or '').lower()
+            if any(t in n_low or t in l_low for t in native_tabs):
+                try:
+                    k.setFlag(nuke.INVISIBLE)
+                    k.setVisible(False)
+                except Exception:
+                    pass
+
+
+def toggle_native_roto_tabs(node):
+    """
+    Toggles visibility of extra native Roto tabs on demand.
+    """
+    native_tabs = {'transform', 'motion blur', 'shape', 'clone', 'lifetime', 'tracking'}
+    is_currently_hidden = False
+    for k in node.allKnobs():
+        if isinstance(k, nuke.Tab_Knob):
+            n_low = (k.name() or '').lower()
+            l_low = (k.label() or '').lower()
+            if any(t in n_low or t in l_low for t in native_tabs):
+                if k.getFlag(nuke.INVISIBLE) or not k.visible():
+                    is_currently_hidden = True
+                    break
+
+    should_hide = not is_currently_hidden
+    for k in node.allKnobs():
+        if isinstance(k, nuke.Tab_Knob):
+            n_low = (k.name() or '').lower()
+            l_low = (k.label() or '').lower()
+            if any(t in n_low or t in l_low for t in native_tabs):
+                try:
+                    if should_hide:
+                        k.setFlag(nuke.INVISIBLE)
+                        k.setVisible(False)
+                    else:
+                        k.clearFlag(nuke.INVISIBLE)
+                        k.setVisible(True)
+                except Exception:
+                    pass
+
+    state_text = "hidden (AutoRoto is Tab 1)" if should_hide else "restored"
+    if node.knob('ar_status'):
+        node.knob('ar_status').setValue(f"Extra tabs {state_text}.")
+
+
+def make_autoroto_first_tab(node_name: Optional[str] = None):
+    """
+    Moves the AutoRoto tab to the 1st position (index 0) in the Properties panel
+    and focuses it immediately.
+    """
+    if not QtWidgets:
+        return
+
+    def _do_move():
+        app = QtWidgets.QApplication.instance()
+        if not app:
+            return
+        for w in app.allWidgets():
+            if isinstance(w, QtWidgets.QTabBar):
+                try:
+                    count = w.count()
+                    auto_idx = -1
+                    for i in range(count):
+                        t = w.tabText(i).replace('&', '').strip()
+                        if 'AutoRoto' in t:
+                            auto_idx = i
+                            break
+                    if auto_idx != -1:
+                        if auto_idx != 0:
+                            w.moveTab(auto_idx, 0)
+                        w.setCurrentIndex(0)
+                except Exception:
+                    pass
+
+    _do_move()
+    if QtCore:
+        QtCore.QTimer.singleShot(40, _do_move)
+        QtCore.QTimer.singleShot(120, _do_move)
+
+
+def on_node_knob_changed(node, knob):
+    """
+    Listens for panel open events to guarantee AutoRoto remains Tab 1 and focused.
+    """
+    if not node or not knob:
+        return
+    kname = knob.name()
+    if kname == 'showPanel' and knob.value():
+        make_autoroto_first_tab(node.name())
+
+
 def setup_autoroto_knobs(node):
     """
     Equips a native Roto node with Tracker-style VCR buttons & CoTracker controls.
+    Arranges AutoRoto as the first tab (Tab 1).
     """
+    # 0. Clean up obsolete duplicated Roto settings knobs if present
+    old_roto_knobs = [
+        'ar_div_roto', 'ar_output', 'ar_premultiply', 'ar_cliptype',
+        'ar_replace', 'ar_opacity', 'ar_feather', 'ar_feather_falloff', 'ar_feather_type'
+    ]
+    for ok in old_roto_knobs:
+        if node.knob(ok):
+            try:
+                node.removeKnob(node.knob(ok))
+            except Exception:
+                pass
+
+    # If AutoRotoTrackerTab exists from earlier version, update label to 'AutoRoto'
     if node.knob('AutoRotoTrackerTab'):
+        node.knob('AutoRotoTrackerTab').setLabel('AutoRoto')
+
+    # If tab already exists, ensure key_step and resolution are present and tabs are arranged
+    if node.knob('AutoRoto') or node.knob('AutoRotoTrackerTab'):
+        if not node.knob('ar_key_step'):
+            k_step = nuke.Int_Knob('ar_key_step', 'Key Step')
+            k_step.setValue(1)
+            k_step.setRange(1, 10)
+            k_step.setTooltip('Keyframe interval for baking (1 = every frame, 2 = every 2nd frame, 5 = every 5th frame). Keeps spline curves sparse and easy to edit.')
+            node.addKnob(k_step)
+        if not node.knob('ar_resolution'):
+            k_res = nuke.Enumeration_Knob(
+                'ar_resolution', 'Tracking Res',
+                ['720p (Fast / AI Optimized)', '960p (Balanced)', 'Full (Original / Slow)']
+            )
+            k_res.setValue('720p (Fast / AI Optimized)')
+            k_res.setTooltip('Downscale resolution for AI tracking. Automatically unscaled back with floating-point subpixel accuracy.')
+            node.addKnob(k_res)
+        if not node.knob('ar_toggle_tabs'):
+            btn_toggle_tabs = nuke.PyScript_Knob(
+                'ar_toggle_tabs', 'Toggle Extra Tabs',
+                'import nuke_bridge; nuke_bridge.toggle_native_roto_tabs(nuke.thisNode())'
+            )
+            btn_toggle_tabs.setTooltip('Toggle extra native tabs (Transform, Motion Blur, Shape, Clone, Lifetime, Tracking) visibility.')
+            node.addKnob(btn_toggle_tabs)
+        hide_intermediate_native_tabs(node)
+        make_autoroto_first_tab(node.name())
         return
 
-    # 1. Dedicated Tracker Tab
-    tab = nuke.Tab_Knob('AutoRotoTrackerTab', 'AutoRoto Tracker')
+    # 1. Dedicated AutoRoto Tab (Positioned as Tab 1 via moveTab)
+    tab = nuke.Tab_Knob('AutoRoto', 'AutoRoto')
     node.addKnob(tab)
 
     # 2. Header
     title = nuke.Text_Knob(
         'ar_title', '',
-        '<font size=4 color="#e58934"><b>AutoRoto Tracker</b></font> '
+        '<font size=4 color="#e58934"><b>AutoRoto</b></font> '
         '<font color="#888">CoTracker3 GPU (RTX 4080)</font>'
     )
     node.addKnob(title)
@@ -411,25 +623,25 @@ def setup_autoroto_knobs(node):
         'ar_to_start', '|◀',
         'import nuke_bridge; nuke_bridge.on_node_track_to_start(nuke.thisNode())'
     )
-    btn_to_start.setTooltip('Track from reference frame to start frame')
+    btn_to_start.setTooltip('Track backward from reference frame to start frame')
 
     btn_step_bwd = nuke.PyScript_Knob(
         'ar_step_bwd', '◀',
         'import nuke_bridge; nuke_bridge.on_node_track_step(nuke.thisNode(), -1)'
     )
-    btn_step_bwd.setTooltip('Track 1 frame backward')
+    btn_step_bwd.setTooltip('Track backward by Key Step')
 
     btn_step_fwd = nuke.PyScript_Knob(
         'ar_step_fwd', '▶',
         'import nuke_bridge; nuke_bridge.on_node_track_step(nuke.thisNode(), 1)'
     )
-    btn_step_fwd.setTooltip('Track 1 frame forward')
+    btn_step_fwd.setTooltip('Track forward by Key Step')
 
     btn_to_end = nuke.PyScript_Knob(
         'ar_to_end', '▶|',
         'import nuke_bridge; nuke_bridge.on_node_track_to_end(nuke.thisNode())'
     )
-    btn_to_end.setTooltip('Track from reference frame to end frame')
+    btn_to_end.setTooltip('Track forward from reference frame to end frame')
 
     btn_range = nuke.PyScript_Knob(
         'ar_track_range', '<b><font color="#4caf50">🚀 Track Full Range</font></b>',
@@ -443,7 +655,7 @@ def setup_autoroto_knobs(node):
     node.addKnob(btn_to_end)
     node.addKnob(btn_range)
 
-    # 4. Divider & Frame Range
+    # 4. Divider & Frame Range + Key Step
     node.addKnob(nuke.Text_Knob('ar_div1', ''))
 
     curr_f = int(nuke.frame())
@@ -452,6 +664,7 @@ def setup_autoroto_knobs(node):
 
     k_ref = nuke.Int_Knob('ar_ref_frame', 'Ref Frame')
     k_ref.setValue(curr_f)
+    k_ref.setTooltip('Reference frame where your roto spline is hand-drawn and anchored.')
     node.addKnob(k_ref)
 
     k_set_curr = nuke.PyScript_Knob(
@@ -474,6 +687,20 @@ def setup_autoroto_knobs(node):
     )
     node.addKnob(k_sync_range)
 
+    k_step = nuke.Int_Knob('ar_key_step', 'Key Step')
+    k_step.setValue(1)
+    k_step.setRange(1, 10)
+    k_step.setTooltip('Keyframe interval for baking (1 = every frame, 2 = every 2nd frame, 5 = every 5th frame). Keeps spline curves sparse and easy to edit.')
+    node.addKnob(k_step)
+
+    k_res = nuke.Enumeration_Knob(
+        'ar_resolution', 'Tracking Res',
+        ['720p (Fast / AI Optimized)', '960p (Balanced)', 'Full (Original / Slow)']
+    )
+    k_res.setValue('720p (Fast / AI Optimized)')
+    k_res.setTooltip('Downscale resolution for AI tracking. High resolution footage is automatically downscaled for 3-5x faster GPU inference, then unscaled back to original resolution with floating-point subpixel accuracy.')
+    node.addKnob(k_res)
+
     # 5. Options
     k_tangents = nuke.Boolean_Knob('ar_keep_tangents', 'Preserve Curvature / Tangents')
     k_tangents.setValue(True)
@@ -487,65 +714,7 @@ def setup_autoroto_knobs(node):
     btn_fix_tangents.setTooltip('Cleans corrupted Bezier tangent handles and restores crisp curvature matching reference frame, instantly eliminating loops.')
     node.addKnob(btn_fix_tangents)
 
-    # 6. Roto Parameters Section (Original Roto settings directly accessible and synchronized here)
-    node.addKnob(nuke.Text_Knob('ar_div_roto', '<b><font color="#e58934">Roto Settings</font></b>'))
-
-    # Output channel mask (e.g. alpha, rgba)
-    k_out = nuke.ChannelMask_Knob('ar_output', 'output')
-    if node.knob('output'):
-        k_out.setValue(node['output'].value())
-    node.addKnob(k_out)
-
-    # Premultiply
-    k_premult = nuke.Channel_Knob('ar_premultiply', 'premultiply')
-    if node.knob('premultiply'):
-        k_premult.setValue(node['premultiply'].value())
-    node.addKnob(k_premult)
-
-    # Clip to format
-    k_cliptype = nuke.Enumeration_Knob('ar_cliptype', 'clip to', ['no clip', 'bbox', 'format', 'union', 'intersect'])
-    if node.knob('cliptype'):
-        k_cliptype.setValue(node['cliptype'].value())
-    node.addKnob(k_cliptype)
-
-    k_replace = nuke.Boolean_Knob('ar_replace', 'replace')
-    if node.knob('replace'):
-        k_replace.setValue(bool(node['replace'].value()))
-    node.addKnob(k_replace)
-
-    # Opacity slider (0.0 to 1.0)
-    k_opacity = nuke.Double_Knob('ar_opacity', 'opacity')
-    k_opacity.setRange(0.0, 1.0)
-    if node.knob('opacity'):
-        k_opacity.setValue(float(node['opacity'].value()))
-    else:
-        k_opacity.setValue(1.0)
-    node.addKnob(k_opacity)
-
-    # Feather slider (-100 to 100)
-    k_feather = nuke.Double_Knob('ar_feather', 'feather')
-    k_feather.setRange(-100.0, 100.0)
-    if node.knob('feather'):
-        k_feather.setValue(float(node['feather'].value()))
-    else:
-        k_feather.setValue(0.0)
-    node.addKnob(k_feather)
-
-    # Feather falloff slider
-    k_falloff = nuke.Double_Knob('ar_feather_falloff', 'feather falloff')
-    k_falloff.setRange(0.2, 5.0)
-    if node.knob('feather_falloff'):
-        k_falloff.setValue(float(node['feather_falloff'].value()))
-    else:
-        k_falloff.setValue(1.0)
-    node.addKnob(k_falloff)
-
-    k_ftype = nuke.Enumeration_Knob('ar_feather_type', '', ['linear', 'smooth', 'ease-in', 'ease-out'])
-    if node.knob('feather_type'):
-        k_ftype.setValue(node['feather_type'].value())
-    node.addKnob(k_ftype)
-
-    # 7. Utilities & Status
+    # 6. Utilities & Status
     node.addKnob(nuke.Text_Knob('ar_div2', ''))
 
     k_open_panel = nuke.PyScript_Knob(
@@ -560,73 +729,58 @@ def setup_autoroto_knobs(node):
     )
     node.addKnob(k_check_gpu)
 
+    btn_toggle_tabs = nuke.PyScript_Knob(
+        'ar_toggle_tabs', 'Toggle Extra Tabs',
+        'import nuke_bridge; nuke_bridge.toggle_native_roto_tabs(nuke.thisNode())'
+    )
+    btn_toggle_tabs.setTooltip('Toggle extra native tabs (Transform, Motion Blur, Shape, Clone, Lifetime, Tracking) visibility.')
+    node.addKnob(btn_toggle_tabs)
+
     k_status = nuke.String_Knob('ar_status', 'Status')
     k_status.setValue('Ready. Draw a shape on Ref Frame and click Track.')
     node.addKnob(k_status)
 
-    # Set knobChanged callback for bidirectional synchronization between ar_* and native knobs
+    # Hide intermediate native tabs so AutoRoto and Roto sit side-by-side
+    hide_intermediate_native_tabs(node)
+
+    # Attach showPanel listener and move tab to position 0 (Tab 1)
     cb_code = """
 import nuke_bridge
-nuke_bridge.on_autoroto_knob_changed(nuke.thisNode(), nuke.thisKnob())
+nuke_bridge.on_node_knob_changed(nuke.thisNode(), nuke.thisKnob())
 """
     node.knob('knobChanged').setValue(cb_code)
+    make_autoroto_first_tab(node.name())
 
 
 def on_autoroto_knob_changed(node, knob):
     """
-    Synchronizes AutoRoto tab Roto controls with native Roto knobs bi-directionally.
+    Deprecated / No-op: AutoRoto is now Tab 1.
     """
-    if not node or not knob:
-        return
-    kname = knob.name()
-
-    mapping = {
-        'ar_output': 'output',
-        'ar_premultiply': 'premultiply',
-        'ar_cliptype': 'cliptype',
-        'ar_replace': 'replace',
-        'ar_opacity': 'opacity',
-        'ar_feather': 'feather',
-        'ar_feather_falloff': 'feather_falloff',
-        'ar_feather_type': 'feather_type'
-    }
-
-    if kname in mapping:
-        target = mapping[kname]
-        if node.knob(target):
-            try:
-                node.knob(target).setValue(knob.value())
-            except Exception:
-                pass
-    elif kname in mapping.values():
-        for ar_k, nat_k in mapping.items():
-            if nat_k == kname and node.knob(ar_k):
-                try:
-                    node.knob(ar_k).setValue(knob.value())
-                except Exception:
-                    pass
+    pass
 
 
 def create_autoroto_node():
     """
-    Creates a native Nuke Roto node equipped with Tracker-style VCR buttons.
+    Creates a native Nuke Roto node equipped with AutoRoto as the first tab (Tab 1).
     """
     node = nuke.createNode('Roto')
     node.setName('AutoRoto1')
     setup_autoroto_knobs(node)
-    if node.knob('AutoRotoTrackerTab'):
-        node.knob('AutoRotoTrackerTab').setFlag(0)
+    hide_intermediate_native_tabs(node)
+    make_autoroto_first_tab(node.name())
     return node
 
 
 def add_autoroto_to_selected():
     """
-    Adds Tracker-style controls to the currently selected Roto node.
+    Adds AutoRoto controls to the currently selected Roto node and arranges it as Tab 1.
     """
     node = nuke.selectedNode()
     if node and node.Class() in ('Roto', 'RotoPaint'):
         setup_autoroto_knobs(node)
-        nuke.message(f"Added AutoRoto Tracker controls to '{node.name()}'!")
+        hide_intermediate_native_tabs(node)
+        make_autoroto_first_tab(node.name())
+        nuke.message(f"Added AutoRoto as Tab 1 on '{node.name()}'!")
     else:
         nuke.message("Please select a Roto or RotoPaint node first.")
 
@@ -727,44 +881,82 @@ def _run_tracking_for_range(roto_node, start_f: int, end_f: int, ref_f: int):
     t_rel = float(ref_f - start_f)
     queries = [{"index": p["index"], "t": t_rel, "x": float(p["x"]), "y": float(p["y"])} for p in pts_info]
 
+    # Resolution downscaling configuration
+    res_val = roto_node['ar_resolution'].value() if roto_node.knob('ar_resolution') else '720p'
+    if '720' in res_val:
+        max_size = 720
+    elif '960' in res_val:
+        max_size = 960
+    else:
+        max_size = 0  # Full native resolution
+
+    total_frames = end_f - start_f + 1
     progress = nuke.ProgressTask(f"AutoRoto: Tracking {len(pts_info)} points on RTX 4080...")
-    progress.setProgress(15)
-    progress.setMessage("Exporting frames...")
+    progress.setProgress(5)
+    progress.setMessage(f"Exporting {total_frames} frames from Nuke...")
 
     temp_dir = None
     try:
         image_paths, temp_dir = bridge.export_source_frames(source_node, start_f, end_f)
-        progress.setProgress(45)
-        progress.setMessage("Running CoTracker GPU inference...")
+        if progress.isCancelled():
+            raise RuntimeError("Tracking cancelled by user.")
+
+        progress.setProgress(15)
+        progress.setMessage("Initializing CoTracker GPU worker...")
+
+        def on_worker_progress(pct: float, msg: str):
+            if progress.isCancelled():
+                raise RuntimeError("Tracking cancelled by user.")
+            # Map worker 0-100% to overall 15-90%
+            overall_pct = int(15 + (pct / 100.0) * 75)
+            progress.setProgress(overall_pct)
+            progress.setMessage(msg)
 
         tracks = tracker_core.run_cotracker_point_tracking(
             image_paths=image_paths,
             queries=queries,
-            start_frame=start_f
+            start_frame=start_f,
+            max_size=max_size,
+            chunk_size=100,
+            progress_callback=on_worker_progress
         )
 
-        progress.setProgress(85)
-        progress.setMessage("Baking keyframes to Roto...")
+        if progress.isCancelled():
+            raise RuntimeError("Tracking cancelled by user.")
+
+        progress.setProgress(92)
+        progress.setMessage("Baking keyframes to Roto spline...")
 
         keep_tg = bool(roto_node['ar_keep_tangents'].value()) if roto_node.knob('ar_keep_tangents') else True
+        key_step = int(roto_node['ar_key_step'].value()) if roto_node.knob('ar_key_step') else 1
+        key_step = max(1, key_step)
+
         ok = bridge.bake_tracking_data_to_roto(
-            roto_node, shape, tracks, ref_f, keep_tangents=keep_tg
+            roto_node, shape, tracks, ref_f, keep_tangents=keep_tg, key_step=key_step
         )
 
         progress.setProgress(100)
         if ok:
-            msg = f"✓ Tracked & Baked {len(pts_info)} points across frames {start_f}-{end_f}!"
+            step_info = f" (Key Step: {key_step})" if key_step > 1 else ""
+            res_info = f" [{max_size}p]" if max_size > 0 else " [Full Res]"
+            msg = f"✓ Tracked & Baked {len(pts_info)} points{step_info}{res_info} across frames {start_f}-{end_f}!"
             if roto_node.knob('ar_status'):
                 roto_node.knob('ar_status').setValue(msg)
-            nuke.message(f"AutoRoto: Complete!\n{len(pts_info)} points tracked and baked across {end_f - start_f + 1} frames.")
+            nuke.message(f"AutoRoto: Complete!\n{len(pts_info)} points tracked and baked across {total_frames} frames{step_info}{res_info}.")
         else:
             if roto_node.knob('ar_status'):
                 roto_node.knob('ar_status').setValue("Bake failed.")
 
     except Exception as e:
-        if roto_node.knob('ar_status'):
-            roto_node.knob('ar_status').setValue(f"Error: {str(e)}")
-        nuke.message(f"AutoRoto Error:\n{str(e)}")
+        err_msg = str(e)
+        if "cancelled" in err_msg.lower():
+            if roto_node.knob('ar_status'):
+                roto_node.knob('ar_status').setValue("Tracking cancelled by user.")
+            nuke.message("AutoRoto: Tracking was cancelled.")
+        else:
+            if roto_node.knob('ar_status'):
+                roto_node.knob('ar_status').setValue(f"Error: {err_msg}")
+            nuke.message(f"AutoRoto Error:\n{err_msg}")
 
     finally:
         del progress
@@ -801,8 +993,12 @@ def on_node_track_to_start(roto_node):
 
 
 def on_node_track_step(roto_node, direction: int):
+    key_step = int(roto_node['ar_key_step'].value()) if roto_node.knob('ar_key_step') else 1
+    key_step = max(1, key_step)
+    step = direction * key_step
+
     curr = int(nuke.frame())
-    target = curr + direction
+    target = curr + step
     start_f = min(curr, target)
     end_f = max(curr, target)
     _run_tracking_for_range(roto_node, start_f, end_f, curr)

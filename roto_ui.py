@@ -399,14 +399,23 @@ class AutoRotoPanel(QWidget):
         temp_dir = None
         try:
             image_paths, temp_dir = self.bridge.export_source_frames(source_node, start_f, end_f)
-            self.prog_bar.setValue(35)
-            self.status_label.setText("Running CoTracker3 inference on GPU (RTX 4080)...")
+            self.prog_bar.setValue(15)
+            self.status_label.setText("Preparing CoTracker GPU worker...")
             QtWidgets.QApplication.processEvents()
+
+            def on_progress(pct: float, msg: str):
+                overall_pct = int(15 + (pct / 100.0) * 75)
+                self.prog_bar.setValue(overall_pct)
+                self.status_label.setText(f"GPU: {msg}")
+                QtWidgets.QApplication.processEvents()
 
             tracks = tracker_core.run_cotracker_point_tracking(
                 image_paths=image_paths,
                 queries=queries,
-                start_frame=start_f
+                start_frame=start_f,
+                max_size=720,
+                chunk_size=100,
+                progress_callback=on_progress
             )
 
             self.tracked_data = tracks

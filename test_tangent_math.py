@@ -99,5 +99,51 @@ class TestTangentMath(unittest.TestCase):
         self.assertEqual(lt_cur_x, 0.0)
         self.assertEqual(lt_cur_y, 0.0)
 
+    def compute_bake_frames(self, all_frames, ref_frame, key_step):
+        min_f = min(all_frames)
+        max_f = max(all_frames)
+        key_step = max(1, int(key_step))
+        if key_step == 1:
+            return set(all_frames)
+        bake_frames = set()
+        bake_frames.add(ref_frame)
+        f = ref_frame + key_step
+        while f <= max_f:
+            if f in all_frames:
+                bake_frames.add(f)
+            f += key_step
+        if max_f in all_frames:
+            bake_frames.add(max_f)
+        f = ref_frame - key_step
+        while f >= min_f:
+            if f in all_frames:
+                bake_frames.add(f)
+            f -= key_step
+        if min_f in all_frames:
+            bake_frames.add(min_f)
+        return bake_frames
+
+    def test_key_step_1_includes_all_frames(self):
+        frames = set(range(1, 21))
+        baked = self.compute_bake_frames(frames, ref_frame=1, key_step=1)
+        self.assertEqual(baked, frames)
+
+    def test_key_step_interval_and_anchors(self):
+        frames = set(range(1, 21))
+        # ref = 10, step = 5 -> expect {10, 15, 20, 5, 1 (boundary)}
+        baked = self.compute_bake_frames(frames, ref_frame=10, key_step=5)
+        self.assertIn(10, baked)
+        self.assertIn(15, baked)
+        self.assertIn(20, baked)
+        self.assertIn(5, baked)
+        self.assertIn(1, baked)  # boundary frame
+        self.assertEqual(baked, {1, 5, 10, 15, 20})
+
+    def test_key_step_step_3(self):
+        frames = set(range(1, 11))
+        # ref = 1, step = 3 -> expect 1, 4, 7, 10
+        baked = self.compute_bake_frames(frames, ref_frame=1, key_step=3)
+        self.assertEqual(baked, {1, 4, 7, 10})
+
 if __name__ == '__main__':
     unittest.main()
