@@ -1,12 +1,11 @@
 """
 AutoRoto Menu Registration (menu.py)
-Integrates AutoRoto Roto Node (Tracker Buttons) and PySide Panel into Nuke.
+Integrates AutoRoto Roto Node (Tracker Buttons) into Nuke.
 """
 
 import os
 import sys
 import nuke
-import nukescripts
 
 _curr_dir = os.path.dirname(os.path.abspath(__file__))
 if _curr_dir not in sys.path:
@@ -14,20 +13,7 @@ if _curr_dir not in sys.path:
 
 import nuke_bridge
 
-# 1. Register as a Dockable Pane in Nuke
-def _register_dockable_panel():
-    try:
-        nukescripts.panels.registerWidgetAsPanel(
-            'roto_ui.AutoRotoPanel',
-            'AutoRoto Panel',
-            'uk.co.autoroto.AutoRotoPanel'
-        )
-    except Exception:
-        pass
-
-_register_dockable_panel()
-
-# 2. Add to Nodes Toolbar
+# 1. Add to Nodes Toolbar
 toolbar = nuke.menu('Nodes')
 autoroto_menu = toolbar.addMenu('AutoRoto', icon='Roto.png')
 
@@ -46,15 +32,7 @@ autoroto_menu.addCommand(
     icon='Roto.png'
 )
 
-# Open PySide Panel
-autoroto_menu.addCommand(
-    'Open AutoRoto PySide Panel',
-    'import main; main.launch_panel(dockable=False)',
-    icon='Roto.png',
-    shortcut='Ctrl+Alt+Shift+R'
-)
-
-# 3. Add to Draw Menu
+# 2. Add to Draw Menu
 draw_menu = toolbar.findItem('Draw')
 if draw_menu:
     draw_menu.addCommand(
@@ -63,7 +41,7 @@ if draw_menu:
         icon='Roto.png'
     )
 
-# 4. Add to Main Menu Bar
+# 3. Add to Main Menu Bar
 main_menubar = nuke.menu('Nuke')
 top_menu = main_menubar.addMenu('&AutoRoto')
 top_menu.addCommand(
@@ -77,17 +55,11 @@ top_menu.addCommand(
 )
 top_menu.addSeparator()
 top_menu.addCommand(
-    'Open AutoRoto PySide Panel',
-    'import main; main.launch_panel(dockable=False)',
-    shortcut='Ctrl+Alt+Shift+R'
-)
-top_menu.addSeparator()
-top_menu.addCommand(
     'Check CoTracker GPU Status',
     """import tracker_core; info = tracker_core.check_ai_environment(); nuke.message(f"CoTracker AI Status:\\n\\n• Device: {info.get('device_name')}\\n• CUDA: {info.get('cuda')}\\n• PyTorch: {info.get('torch_version')}\\n• Status: {info.get('message')}")"""
 )
 top_menu.addSeparator()
 top_menu.addCommand(
     'About AutoRoto',
-    """import nuke; nuke.message("AutoRoto v2.0 (Tracker Buttons on Roto)\\n\\nNative Nuke Roto Node equipped with Tracker-style VCR buttons & CoTracker3 GPU backend.\\n\\n• Draw shapes natively in Nuke Viewer\\n• VCR Tracker buttons: |◀, ◀, ▶, ▶|, Track Range\\n• Zero-drift bidirectional tracking on RTX 4080")"""
+    """import nuke; nuke.message("AutoRoto v2.1 (Tracker Buttons on Roto)\\n\\nNative Nuke Roto Node equipped with Tracker-style VCR buttons & CoTracker3 GPU backend.\\n\\n• Draw shapes natively in Nuke Viewer\\n• VCR Tracker buttons: |◀, ◀, ▶, ▶|, Track Range\\n• Zero-drift bidirectional tracking on RTX 4080")"""
 )

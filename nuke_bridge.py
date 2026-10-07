@@ -25,6 +25,55 @@ import nuke
 import nuke.rotopaint as rp
 import tracker_core
 
+def get_nuke_cache_temp_dir() -> str:
+    """
+    Retrieves the Cache Disk Temp Directory configured in individual Nuke Preferences.
+    Prioritizes:
+      1. Nuke Preferences node ('DiskCachePath', 'localCachePath', 'DiskCacheDirectory')
+      2. Environment variables ('NUKE_DISK_CACHE', 'NUKE_TEMP_DIR', 'AUTOROTO_CACHE_DIR')
+      3. System temp directory
+    Creates and returns a dedicated 'AutoRoto_Temp' directory within the cache disk.
+    """
+    candidates = []
+
+    # 1. Query Nuke Preferences node
+    try:
+        pref = nuke.toNode('preferences')
+        if pref:
+            for knob_name in ('DiskCachePath', 'localCachePath', 'DiskCacheDirectory'):
+                if pref.knob(knob_name):
+                    val = pref[knob_name].value()
+                    if val and str(val).strip():
+                        expanded = os.path.expandvars(os.path.expanduser(str(val).strip()))
+                        candidates.append(expanded)
+    except Exception:
+        pass
+
+    # 2. Check Nuke & Custom Environment Variables
+    for env_var in ('NUKE_DISK_CACHE', 'NUKE_TEMP_DIR', 'AUTOROTO_CACHE_DIR'):
+        v = os.environ.get(env_var)
+        if v and os.path.isdir(v):
+            candidates.append(v)
+
+    # 3. Test validity and create subfolder
+    for path in candidates:
+        try:
+            path = path.replace("\\", "/").rstrip("/")
+            if not os.path.exists(path):
+                os.makedirs(path, exist_ok=True)
+            if os.path.isdir(path) and os.access(path, os.W_OK):
+                auto_roto_cache = os.path.join(path, "AutoRoto_Temp").replace("\\", "/")
+                os.makedirs(auto_roto_cache, exist_ok=True)
+                return auto_roto_cache
+        except Exception:
+            continue
+
+    # 4. Fallback to OS temp directory
+    fallback = os.path.join(tempfile.gettempdir(), "AutoRoto_Temp").replace("\\", "/")
+    os.makedirs(fallback, exist_ok=True)
+    return fallback
+
+
 class NukeRotoBridge:
     """
     Bridge connecting Roto nodes directly to active Nuke session & CoTracker backend.
@@ -179,8 +228,9 @@ class NukeRotoBridge:
             except Exception:
                 pass
 
-        # Fast temporary render via Write node
-        temp_dir = tempfile.mkdtemp(prefix="autoroto_frames_")
+        # Fast temporary render via Write node in Nuke cache directory
+        base_cache = get_nuke_cache_temp_dir()
+        temp_dir = tempfile.mkdtemp(prefix="autoroto_frames_", dir=base_cache)
         pattern = os.path.join(temp_dir, "frame_%04d.jpg").replace("\\", "/")
 
         write_node = nuke.nodes.Write(
@@ -566,7 +616,8 @@ def setup_autoroto_knobs(node):
     # 0. Clean up obsolete duplicated Roto settings knobs if present
     old_roto_knobs = [
         'ar_div_roto', 'ar_output', 'ar_premultiply', 'ar_cliptype',
-        'ar_replace', 'ar_opacity', 'ar_feather', 'ar_feather_falloff', 'ar_feather_type'
+        'ar_replace', 'ar_opacity', 'ar_feather', 'ar_feather_falloff', 'ar_feather_type',
+        'ar_open_panel'
     ]
     for ok in old_roto_knobs:
         if node.knob(ok):
@@ -716,12 +767,6 @@ def setup_autoroto_knobs(node):
 
     # 6. Utilities & Status
     node.addKnob(nuke.Text_Knob('ar_div2', ''))
-
-    k_open_panel = nuke.PyScript_Knob(
-        'ar_open_panel', 'Open Full PySide Panel',
-        'import main; main.launch_panel(dockable=False)'
-    )
-    node.addKnob(k_open_panel)
 
     k_check_gpu = nuke.PyScript_Knob(
         'ar_check_gpu', 'Check GPU Status',
@@ -912,13 +957,15 @@ def _run_tracking_for_range(roto_node, start_f: int, end_f: int, ref_f: int):
             progress.setProgress(overall_pct)
             progress.setMessage(msg)
 
+        cache_base = get_nuke_cache_temp_dir()
         tracks = tracker_core.run_cotracker_point_tracking(
             image_paths=image_paths,
             queries=queries,
             start_frame=start_f,
             max_size=max_size,
             chunk_size=100,
-            progress_callback=on_worker_progress
+            progress_callback=on_worker_progress,
+            temp_dir_base=cache_base
         )
 
         if progress.isCancelled():

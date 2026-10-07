@@ -351,17 +351,30 @@ def run_cotracker_point_tracking(
     max_size: int = 720,
     chunk_size: int = 100,
     progress_callback: Optional[Any] = None,
+    temp_dir_base: Optional[str] = None,
     timeout_sec: int = 600
 ) -> Dict[int, Dict[int, Tuple[float, float, float]]]:
     """
     Executes CoTracker 3 offline GPU tracking with real-time progress streaming,
     intelligent downscaling, and 100-frame chunking.
+    Uses custom temp_dir_base (Nuke preferences cache disk) if specified.
     """
     py_exe = find_ai_python(custom_python_path)
     if not py_exe:
         raise RuntimeError("CoTracker: PyTorch/CUDA environment not found.")
 
-    temp_dir = tempfile.mkdtemp(prefix="autoroto_cotracker_")
+    if not temp_dir_base:
+        for env_v in ("AUTOROTO_CACHE_DIR", "NUKE_DISK_CACHE", "NUKE_TEMP_DIR"):
+            cand = os.environ.get(env_v)
+            if cand and os.path.isdir(cand):
+                temp_dir_base = cand
+                break
+
+    if temp_dir_base and os.path.exists(temp_dir_base):
+        os.makedirs(temp_dir_base, exist_ok=True)
+        temp_dir = tempfile.mkdtemp(prefix="autoroto_cotracker_", dir=temp_dir_base)
+    else:
+        temp_dir = tempfile.mkdtemp(prefix="autoroto_cotracker_")
     worker_script = os.path.join(temp_dir, "worker.py")
     config_path = os.path.join(temp_dir, "config.json")
     output_path = os.path.join(temp_dir, "output.json")
@@ -443,12 +456,14 @@ def run_cotracker_point_tracking(
 
     finally:
         try:
-            if os.path.exists(worker_script):
-                os.remove(worker_script)
-            if os.path.exists(config_path):
-                os.remove(config_path)
-            if os.path.exists(output_path):
-                os.remove(output_path)
-            os.rmdir(temp_dir)
+            if proc.stdout:
+                proc.stdout.close()
+            if proc.stderr:
+                proc.stderr.close()
+        except Exception:
+            pass
+        try:
+            if os.path.exists(temp_dir):
+                shutil.rmtree(temp_dir, ignore_errors=True)
         except Exception:
             pass

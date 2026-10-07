@@ -1,5 +1,12 @@
-# AutoRoto (v2.0) - Roto Node with Tracker Buttons & CoTracker GPU
+# AutoRoto (v2.1) - Roto Node with Tracker Buttons & CoTracker GPU
 > **Nuke 네이티브 Roto 노드 복제 + 트래커 VCR 버튼 탑재**: Nuke Roto 노드에 트래커 노드의 트래킹 버튼들을 그대로 탑재하고, Meta CoTracker 3 GPU 백엔드로 구동되는 혁신적인 로토 툴킷
+
+### 🖥️ 지원 환경 및 호환 버전 (Compatibility)
+- **지원 Nuke 버전**: **Foundry Nuke 13.0 ~ 17.x+** *(Nuke 13, 14, 15, 16, 17 전 버전 완벽 호환)*
+- **UI 방식**: **100% 네이티브 Roto 노드 일체형** (별도 PySide 창 불필요, Roto 1번 탭 직접 제어)
+- **운영체제(OS)**: Windows 10/11, Linux (Rocky, CentOS, Ubuntu)
+- **GPU 환경**: NVIDIA CUDA 지원 GPU (RTX 30xx, 40xx, RTX Ada, Quadro 등)
+- **AI 런타임**: Python 3.10 ~ 3.12 (PyTorch 2.0+ with CUDA)
 
 ---
 
@@ -8,8 +15,8 @@
 1. **`rootLayer` API 오류 수정 완료**:
    - Nuke `_rotopaint.RotoKnob`에서 발생하는 `'_rotopaint.RotoKnob' object has no attribute 'root'` 오류를 해결했습니다.
    - Nuke Python API 공식 명세에 맞춰 `curves.rootLayer`로 참조를 정규화하여 모든 Nuke 버전(13, 14, 15, 16, 17)에서 에러 없이 완벽히 동작합니다.
-2. **Roto 노드 자체에 트래커 버튼 탑재**:
-   - 별도 외부 패널을 띄우지 않고도, **Nuke의 기본 Roto 노드 프로퍼티 창에 Tracker 노드와 동일한 VCR 트래킹 버튼(`|◀`, `◀`, `▶`, `▶|`, `🚀 Track Full Range`)을 직접 탑재**했습니다.
+2. **Roto 노드 자체에 트래커 버튼 탑재 (1번 탭 일체형)**:
+   - 번거로운 외부 PySide 팝업 창 없이, **Nuke의 기본 Roto 노드 프로퍼티 창 1번 탭에 Tracker 노드와 동일한 VCR 트래킹 버튼(`|◀`, `◀`, `▶`, `▶|`, `🚀 Track Full Range`)을 직접 탑재**했습니다.
    - Nuke 뷰어에서 기본 Bezier / B-Spline 펜 도구로 점을 찍고, 프로퍼티 창에서 트래커 버튼만 누르면 CoTracker GPU(RTX 4080)가 즉시 구동되어 모든 제어점에 키프레임이 구워집니다.
 
 ---
@@ -55,8 +62,6 @@ AutoRoto는 Nuke 내장 파이썬과 충돌하지 않도록 외부 Python의 PyT
 ├── menu.py                    # 메뉴 바, 툴바(Draw/Nodes), 단축키(Ctrl+Alt+R) 등록
 ├── nuke_bridge.py             # Nuke Roto 노드 제어, Tab 1 배치, 베지에 탄젠트 복원 및 키프레임 베이킹
 ├── tracker_core.py            # CoTracker 3 GPU 딥러닝 트래커 (100프레임 청크, 실시간 스트리밍, 다운스케일)
-├── roto_ui.py                 # 독립형 PySide 패널 UI
-├── main.py                    # 패널 런처
 ├── test_cotracker_backend.py  # 단위 테스트 스위트
 ├── test_tangent_math.py       # 탄젠트 수학 및 키 스텝 검증 테스트
 ├── README.md                  # 사용자 매뉴얼

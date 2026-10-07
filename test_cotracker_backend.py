@@ -92,5 +92,21 @@ class TestCoTrackerBackend(unittest.TestCase):
         for f in range(0, ref_idx + 1):
             self.assertIn(f, bwd_coverage)
 
+    def test_custom_temp_dir_handling(self):
+        import tempfile
+        import shutil
+        custom_base = tempfile.mkdtemp(prefix="test_autoroto_cache_")
+        try:
+            res = tracker_core.run_cotracker_point_tracking(
+                image_paths=[],
+                queries=[],
+                start_frame=0,
+                temp_dir_base=custom_base
+            )
+            self.assertEqual(res, {})
+        finally:
+            if os.path.exists(custom_base):
+                shutil.rmtree(custom_base, ignore_errors=True)
+
 if __name__ == '__main__':
     unittest.main()
