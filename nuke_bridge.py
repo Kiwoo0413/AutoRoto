@@ -564,17 +564,20 @@ def toggle_native_roto_tabs(node):
 
 def make_autoroto_first_tab(node_name: Optional[str] = None):
     """
-    Moves the AutoRoto tab to the 1st position (index 0) in the Properties panel
-    and focuses it immediately.
+    1. Moves the AutoRoto tab to the 1st position (index 0) in the Properties panel and focuses it.
+    2. Adjusts VCR button sizes (|◀, ◀, ▶, ▶|) to compact width (34px) matching symbol size.
     """
     if not QtWidgets:
         return
 
-    def _do_move():
+    vcr_symbols = {'|◀', '◀', '▶', '▶|'}
+
+    def _do_adjust():
         app = QtWidgets.QApplication.instance()
         if not app:
             return
         for w in app.allWidgets():
+            # Tab bar: focus AutoRoto as Tab 1
             if isinstance(w, QtWidgets.QTabBar):
                 try:
                     count = w.count()
@@ -591,21 +594,30 @@ def make_autoroto_first_tab(node_name: Optional[str] = None):
                 except Exception:
                     pass
 
-    _do_move()
+            # VCR Buttons: compact width matching symbol size
+            elif isinstance(w, QtWidgets.QPushButton):
+                try:
+                    clean_txt = "".join(w.text().replace('&', '').split())
+                    if clean_txt in vcr_symbols:
+                        w.setFixedWidth(34)
+                        w.setSizePolicy(QtWidgets.QSizePolicy.Fixed, QtWidgets.QSizePolicy.Fixed)
+                except Exception:
+                    pass
+
+    _do_adjust()
     if QtCore:
-        QtCore.QTimer.singleShot(40, _do_move)
-        QtCore.QTimer.singleShot(120, _do_move)
+        QtCore.QTimer.singleShot(30, _do_adjust)
+        QtCore.QTimer.singleShot(80, _do_adjust)
+        QtCore.QTimer.singleShot(200, _do_adjust)
 
 
 def on_node_knob_changed(node, knob):
     """
-    Listens for panel open events to guarantee AutoRoto remains Tab 1 and focused.
+    Listens for panel events to guarantee AutoRoto remains Tab 1 and VCR buttons remain compact.
     """
-    if not node or not knob:
+    if not node:
         return
-    kname = knob.name()
-    if kname == 'showPanel' and knob.value():
-        make_autoroto_first_tab(node.name())
+    make_autoroto_first_tab(node.name())
 
 
 def setup_autoroto_knobs(node):
@@ -699,6 +711,12 @@ def setup_autoroto_knobs(node):
         'import nuke_bridge; nuke_bridge.on_node_track_range(nuke.thisNode())'
     )
     btn_range.setTooltip('Run CoTracker GPU on RTX 4080 across entire specified frame range')
+
+    btn_to_start.setFlag(nuke.STARTLINE)
+    btn_step_bwd.clearFlag(nuke.STARTLINE)
+    btn_step_fwd.clearFlag(nuke.STARTLINE)
+    btn_to_end.clearFlag(nuke.STARTLINE)
+    btn_range.clearFlag(nuke.STARTLINE)
 
     node.addKnob(btn_to_start)
     node.addKnob(btn_step_bwd)
@@ -1050,3 +1068,11 @@ def on_node_track_step(roto_node, direction: int):
     end_f = max(curr, target)
     _run_tracking_for_range(roto_node, start_f, end_f, curr)
     nuke.frame(target)
+
+
+# Automatically apply tab move & VCR button sizing if Nuke GUI session is active
+if QtWidgets and QtWidgets.QApplication.instance():
+    try:
+        make_autoroto_first_tab()
+    except Exception:
+        pass
