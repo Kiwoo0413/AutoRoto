@@ -198,13 +198,14 @@ def main():
     test_arr, orig_w, orig_h, scale_x, scale_y = load_frame_array(image_paths[0], max_size)
 
     # Convert initial queries from Nuke bottom-left to scaled image top-left
+    # Note: Exact subpixel height inversion (orig_h - y_nuke)
     initial_scaled_coords = {}
     for q in queries_input:
         pt_idx = q["index"]
         x_nuke = float(q["x"])
         y_nuke = float(q["y"])
         x_orig = x_nuke
-        y_orig = max(0.0, min(float(orig_h - 1), float(orig_h - 1) - y_nuke))
+        y_orig = max(0.0, min(float(orig_h), float(orig_h) - y_nuke))
         x_scaled = x_orig * scale_x
         y_scaled = y_orig * scale_y
         initial_scaled_coords[pt_idx] = (x_scaled, y_scaled)
@@ -214,45 +215,69 @@ def main():
     for pt_idx, (sx, sy) in initial_scaled_coords.items():
         tracked_scaled_results[pt_idx][ref_idx] = (sx, sy, 1.0)
 
-    # Build Chunks Plan
-    chunks_plan = []
-    if total_frames <= chunk_size:
-        chunks_plan.append({"type": "single", "start": 0, "end": total_frames, "query_t": ref_idx, "queries": initial_scaled_coords})
-    else:
-        # Forward chunks from ref_idx to total_frames - 1
-        if ref_idx < total_frames - 1:
-            fwd_cur = ref_idx
-            while fwd_cur < total_frames - 1:
-                fwd_end = min(total_frames, fwd_cur + chunk_size)
-                chunks_plan.append({"type": "forward", "start": fwd_cur, "end": fwd_end})
-                fwd_cur = fwd_end - 1  # 1-frame boundary overlap
+    # Build Chunks Plan:
+    # CoTracker achieves optimal accuracy and zero drift when all queries start at t=0.0.
+    # 1. Forward chunks propagate from ref_idx forward to total_frames - 1.
+    # 2. Backward chunks propagate from ref_idx backward to 0 on time-flipped video.
+    fwd_chunks = []
+    if ref_idx < total_frames - 1:
+        fwd_cur = ref_idx
+        while fwd_cur < total_frames - 1:
+            fwd_end = min(total_frames, fwd_cur + chunk_size)
+            fwd_chunks.append({
+                "dir": "forward",
+                "start_orig": fwd_cur,
+                "end_orig": fwd_end,
+                "paths": image_paths[fwd_cur:fwd_end]
+            })
+            fwd_cur = fwd_end - 1
 
-        # Backward chunks from ref_idx down to 0
-        if ref_idx > 0:
-            bwd_cur = ref_idx
-            while bwd_cur > 0:
-                bwd_start = max(0, bwd_cur - chunk_size + 1)
-                chunks_plan.append({"type": "backward", "start": bwd_start, "end": bwd_cur + 1})
-                bwd_cur = bwd_start
+    bwd_chunks = []
+    if ref_idx > 0:
+        bwd_image_paths = image_paths[0 : ref_idx + 1][::-1]
+        bwd_total = len(bwd_image_paths)
+        bwd_cur = 0
+        while bwd_cur < bwd_total - 1:
+            bwd_end = min(bwd_total, bwd_cur + chunk_size)
+            bwd_chunks.append({
+                "dir": "backward",
+                "bwd_start": bwd_cur,
+                "bwd_end": bwd_end,
+                "paths": bwd_image_paths[bwd_cur:bwd_end]
+            })
+            bwd_cur = bwd_end - 1
 
-    total_chunks = len(chunks_plan)
+    all_chunks = fwd_chunks + bwd_chunks
+    total_chunks = len(all_chunks)
     res_label = f"{max_size}p downscale" if max_size > 0 else "full res"
-    emit_progress(22.0, f"Tracking {total_frames} frames ({res_label}) across {total_chunks} chunk(s)...")
+    emit_progress(22.0, f"Tracking {total_frames} frames ({res_label}) from ref frame {start_frame + ref_idx} across {total_chunks} chunk(s)...")
 
     # Execute Chunks
-    for c_i, plan in enumerate(chunks_plan):
+    for c_i, chunk in enumerate(all_chunks):
         c_num = c_i + 1
-        p_base = 22.0 + (float(c_i) / float(total_chunks)) * 68.0
-        p_step = 68.0 / float(total_chunks)
+        p_base = 22.0 + (float(c_i) / float(max(1, total_chunks))) * 68.0
+        p_step = 68.0 / float(max(1, total_chunks))
 
-        s_idx = plan["start"]
-        e_idx = plan["end"]
-        L = e_idx - s_idx
-        chunk_paths = image_paths[s_idx:e_idx]
+        chunk_paths = chunk["paths"]
+        L = len(chunk_paths)
+        if L <= 1:
+            continue
 
-        f_start_label = start_frame + s_idx
-        f_end_label = start_frame + e_idx - 1
-        emit_progress(p_base + p_step * 0.1, f"Chunk {c_num}/{total_chunks}: Loading {L} frames ({f_start_label} - {f_end_label})...")
+        is_fwd = (chunk["dir"] == "forward")
+        if is_fwd:
+            f_start_label = start_frame + chunk["start_orig"]
+            f_end_label = start_frame + chunk["end_orig"] - 1
+            dir_label = "Forward"
+            anchor_frame = chunk["start_orig"]
+        else:
+            orig_from = ref_idx - chunk["bwd_start"]
+            orig_to = ref_idx - (chunk["bwd_end"] - 1)
+            f_start_label = start_frame + orig_from
+            f_end_label = start_frame + orig_to
+            dir_label = "Backward"
+            anchor_frame = orig_from
+
+        emit_progress(p_base + p_step * 0.1, f"Chunk {c_num}/{total_chunks} ({dir_label}): Loading {L} frames ({f_start_label} -> {f_end_label})...")
 
         # Load and stack frames for this chunk
         chunk_frames = []
@@ -266,34 +291,18 @@ def main():
         pt_indices = [q["index"] for q in queries_input]
         queries_tensor_list = []
 
-        if plan["type"] == "single":
-            q_t = float(plan["query_t"])
-            for pt_idx in pt_indices:
-                qx, qy = plan["queries"][pt_idx]
-                queries_tensor_list.append((q_t, qx, qy))
-            backward_mode = True
-
-        elif plan["type"] == "forward":
-            q_t = 0.0
-            for pt_idx in pt_indices:
-                qx, qy, _ = tracked_scaled_results[pt_idx][s_idx]
-                queries_tensor_list.append((q_t, qx, qy))
-            backward_mode = False
-
-        elif plan["type"] == "backward":
-            q_t = float(L - 1)
-            anchor_idx = e_idx - 1
-            for pt_idx in pt_indices:
-                qx, qy, _ = tracked_scaled_results[pt_idx][anchor_idx]
-                queries_tensor_list.append((q_t, qx, qy))
-            backward_mode = True
+        # Anchor coordinates for this chunk are taken from previous result (or initial query)
+        for pt_idx in pt_indices:
+            qx, qy, _ = tracked_scaled_results[pt_idx][anchor_frame]
+            # In both forward and reversed video, query is ALWAYS at frame 0.0 of this chunk!
+            queries_tensor_list.append((0.0, qx, qy))
 
         queries_tensor = torch.tensor(queries_tensor_list, dtype=torch.float32, device=device).unsqueeze(0)
 
-        emit_progress(p_base + p_step * 0.45, f"Chunk {c_num}/{total_chunks}: GPU CoTracker inference on RTX 4080 ({L} frames)...")
+        emit_progress(p_base + p_step * 0.45, f"Chunk {c_num}/{total_chunks} ({dir_label}): GPU CoTracker inference on RTX 4080 ({L} frames)...")
 
         with torch.no_grad():
-            pred_tracks, pred_vis = model(video_chunk, queries=queries_tensor, backward_tracking=backward_mode)
+            pred_tracks, pred_vis = model(video_chunk, queries=queries_tensor, backward_tracking=False)
 
         pred_tracks = pred_tracks.cpu().numpy()
         pred_vis = pred_vis.cpu().numpy() if pred_vis is not None else None
@@ -301,18 +310,22 @@ def main():
         # Store predictions
         for pt_local_i, pt_idx in enumerate(pt_indices):
             for local_t in range(L):
-                global_frame_idx = s_idx + local_t
+                if is_fwd:
+                    global_f = chunk["start_orig"] + local_t
+                else:
+                    global_f = ref_idx - (chunk["bwd_start"] + local_t)
+
                 pred_x = float(pred_tracks[0, local_t, pt_local_i, 0])
                 pred_y = float(pred_tracks[0, local_t, pt_local_i, 1])
                 vis_v = float(pred_vis[0, local_t, pt_local_i]) if pred_vis is not None else 1.0
-                tracked_scaled_results[pt_idx][global_frame_idx] = (pred_x, pred_y, vis_v)
+                tracked_scaled_results[pt_idx][global_f] = (pred_x, pred_y, vis_v)
 
         del video_chunk
         del queries_tensor
         if device == "cuda":
             torch.cuda.empty_cache()
 
-        emit_progress(p_base + p_step * 0.95, f"Chunk {c_num}/{total_chunks} complete ({f_start_label}-{f_end_label}).")
+        emit_progress(p_base + p_step * 0.95, f"Chunk {c_num}/{total_chunks} complete ({f_start_label} -> {f_end_label}).")
 
     emit_progress(92.0, "Converting trajectories to Nuke resolution...")
 
@@ -325,7 +338,7 @@ def main():
             x_orig = sx / scale_x
             y_orig = sy / scale_y
             x_nuke = x_orig
-            y_nuke = float(orig_h - 1) - y_orig
+            y_nuke = float(orig_h) - y_orig
 
             final_output[str(pt_idx)][str(actual_frame)] = {
                 "x": x_nuke,

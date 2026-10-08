@@ -27,11 +27,11 @@ class TestCoTrackerBackend(unittest.TestCase):
         # Image height H = 1080
         h = 1080
         y_nuke = 350.0
-        # Nuke bottom-left to image top-left
-        y_img = (h - 1) - y_nuke
-        self.assertEqual(y_img, 729.0)
+        # Nuke bottom-left to image top-left (exact continuous subpixel inversion)
+        y_img = h - y_nuke
+        self.assertEqual(y_img, 730.0)
         # Invert back to Nuke bottom-left
-        y_nuke_back = (h - 1) - y_img
+        y_nuke_back = h - y_img
         self.assertEqual(y_nuke_back, 350.0)
 
     def test_downscaling_coordinate_math(self):
@@ -57,40 +57,39 @@ class TestCoTrackerBackend(unittest.TestCase):
         chunk_size = 100
         ref_idx = 120
 
-        chunks_plan = []
-        if total_frames <= chunk_size:
-            chunks_plan.append({"type": "single", "start": 0, "end": total_frames})
-        else:
-            if ref_idx < total_frames - 1:
-                fwd_cur = ref_idx
-                while fwd_cur < total_frames - 1:
-                    fwd_end = min(total_frames, fwd_cur + chunk_size)
-                    chunks_plan.append({"type": "forward", "start": fwd_cur, "end": fwd_end})
-                    fwd_cur = fwd_end - 1
-            if ref_idx > 0:
-                bwd_cur = ref_idx
-                while bwd_cur > 0:
-                    bwd_start = max(0, bwd_cur - chunk_size + 1)
-                    chunks_plan.append({"type": "backward", "start": bwd_start, "end": bwd_cur + 1})
-                    bwd_cur = bwd_start
+        # Test bidirectional chunk plan
+        fwd_chunks = []
+        if ref_idx < total_frames - 1:
+            fwd_cur = ref_idx
+            while fwd_cur < total_frames - 1:
+                fwd_end = min(total_frames, fwd_cur + chunk_size)
+                fwd_chunks.append({"dir": "forward", "start_orig": fwd_cur, "end_orig": fwd_end})
+                fwd_cur = fwd_end - 1
 
-        self.assertGreater(len(chunks_plan), 1)
-        # All frames in sequence are covered
-        fwd_coverage = set()
-        for p in chunks_plan:
-            if p["type"] == "forward":
-                for f in range(p["start"], p["end"]):
-                    fwd_coverage.add(f)
-        for f in range(ref_idx, total_frames):
-            self.assertIn(f, fwd_coverage)
+        bwd_chunks = []
+        if ref_idx > 0:
+            bwd_total = ref_idx + 1
+            bwd_cur = 0
+            while bwd_cur < bwd_total - 1:
+                bwd_end = min(bwd_total, bwd_cur + chunk_size)
+                bwd_chunks.append({"dir": "backward", "bwd_start": bwd_cur, "bwd_end": bwd_end})
+                bwd_cur = bwd_end - 1
 
-        bwd_coverage = set()
-        for p in chunks_plan:
-            if p["type"] == "backward":
-                for f in range(p["start"], p["end"]):
-                    bwd_coverage.add(f)
-        for f in range(0, ref_idx + 1):
-            self.assertIn(f, bwd_coverage)
+        all_chunks = fwd_chunks + bwd_chunks
+        self.assertGreater(len(all_chunks), 1)
+
+        # Verify all frames 0 to total_frames - 1 are covered
+        visited = set()
+        visited.add(ref_idx)
+        for chunk in fwd_chunks:
+            for f in range(chunk["start_orig"], chunk["end_orig"]):
+                visited.add(f)
+        for chunk in bwd_chunks:
+            for b in range(chunk["bwd_start"], chunk["bwd_end"]):
+                visited.add(ref_idx - b)
+
+        for f in range(total_frames):
+            self.assertIn(f, visited)
 
     def test_custom_temp_dir_handling(self):
         import tempfile

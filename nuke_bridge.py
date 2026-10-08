@@ -175,17 +175,105 @@ class NukeRotoBridge:
         else:
             return (tx, ty)
 
-    def extract_shape_points(self, raw_shape, frame: int) -> List[Dict[str, Any]]:
+    def get_shape_world_transform(self, roto_node, raw_shape, frame: float) -> Tuple[Optional[Any], bool]:
+        """
+        Calculates the concatenated transformation matrix from local shape space to global
+        screen/canvas space at the specified frame.
+        Accounts for shape transform and parent layer transforms (Magno Borgo hierarchy).
+        Returns: (matrix, is_identity)
+        """
+        if not hasattr(nuke, 'math') or not hasattr(nuke.math, 'Matrix4'):
+            return None, True
+
+        if not roto_node:
+            roto_node = self.get_selected_roto_node()
+        if not roto_node or not raw_shape:
+            return None, True
+
+        curves = roto_node['curves']
+        root = getattr(curves, 'rootLayer', getattr(curves, 'root', None))
+        if not root:
+            return None, True
+
+        def _find_ancestry(item, target, path):
+            for elem in item:
+                if elem == target:
+                    return path + [elem]
+                if isinstance(elem, rp.Layer):
+                    res = _find_ancestry(elem, target, path + [elem])
+                    if res:
+                        return res
+            return None
+
+        ancestry = _find_ancestry(root, raw_shape, [root])
+        if not ancestry:
+            ancestry = [raw_shape]
+
+        combined_mat = nuke.math.Matrix4()
+        combined_mat.makeIdentity()
+        has_transform = False
+
+        ident = (1.0, 0.0, 0.0, 0.0,
+                 0.0, 1.0, 0.0, 0.0,
+                 0.0, 0.0, 1.0, 0.0,
+                 0.0, 0.0, 0.0, 1.0)
+
+        for elem in ancestry:
+            if hasattr(elem, 'getTransform'):
+                try:
+                    t = elem.getTransform()
+                    if hasattr(t, 'evaluate'):
+                        raw_m = t.evaluate(float(frame)).getMatrix()
+                        if not all(abs(raw_m[i] - ident[i]) < 1e-4 for i in range(16)):
+                            has_transform = True
+                            elem_mat = nuke.math.Matrix4()
+                            for idx in range(16):
+                                elem_mat[idx] = raw_m[idx]
+                            combined_mat = combined_mat * elem_mat
+                except Exception:
+                    pass
+
+        return combined_mat, not has_transform
+
+    @staticmethod
+    def local_to_global_coords(x: float, y: float, world_mat, is_ident: bool) -> Tuple[float, float]:
+        if is_ident or world_mat is None:
+            return x, y
+        try:
+            v = nuke.math.Vector4(x, y, 0.0, 1.0)
+            v_out = world_mat.transform(v)
+            return float(v_out.x), float(v_out.y)
+        except Exception:
+            return x, y
+
+    @staticmethod
+    def global_to_local_coords(x: float, y: float, world_mat, is_ident: bool) -> Tuple[float, float]:
+        if is_ident or world_mat is None:
+            return x, y
+        try:
+            inv_mat = world_mat.inverse()
+            v = nuke.math.Vector4(x, y, 0.0, 1.0)
+            v_out = inv_mat.transform(v)
+            return float(v_out.x), float(v_out.y)
+        except Exception:
+            return x, y
+
+    def extract_shape_points(self, raw_shape, frame: int, roto_node=None) -> List[Dict[str, Any]]:
         """
         Extracts control point coordinates and relative tangents at specified frame.
+        Transforms coordinates to global screen space so CoTracker tracks what is visible on the image.
         """
+        world_mat, is_ident = self.get_shape_world_transform(roto_node, raw_shape, float(frame))
         num_pts = len(raw_shape)
         pts_info = []
 
         for i in range(num_pts):
             pt = raw_shape[i]
             c_pos = pt.center.getPosition(float(frame))
-            cx, cy = float(c_pos.x), float(c_pos.y)
+            local_cx, local_cy = float(c_pos.x), float(c_pos.y)
+
+            # Global screen coordinates for CoTracker query
+            global_cx, global_cy = self.local_to_global_coords(local_cx, local_cy, world_mat, is_ident)
 
             lt_pos = pt.leftTangent.getPosition(float(frame))
             rt_pos = pt.rightTangent.getPosition(float(frame))
@@ -197,8 +285,10 @@ class NukeRotoBridge:
 
             pts_info.append({
                 'index': i,
-                'x': cx,
-                'y': cy,
+                'x': global_cx,
+                'y': global_cy,
+                'local_x': local_cx,
+                'local_y': local_cy,
                 'lt_rel': lt_rel,
                 'rt_rel': rt_rel,
                 'fc_rel': fc_rel,
@@ -209,26 +299,10 @@ class NukeRotoBridge:
 
     def export_source_frames(self, source_node, start_f: int, end_f: int) -> Tuple[List[str], Optional[str]]:
         """
-        Gathers or renders frame sequence for the specified frame range.
-        Returns: (list_of_image_paths, temp_dir_or_None)
+        Renders frame sequence for the specified frame range using Nuke's native Write node.
+        Guarantees exact matching Nuke format dimensions, per-frame evaluation,
+        and universal 8-bit JPEG decoding compatibility for AI tracking.
         """
-        if source_node.Class() == 'Read':
-            try:
-                paths = []
-                all_exist = True
-                for f in range(start_f, end_f + 1):
-                    p = nuke.filename(source_node, nuke.REPLACE)
-                    if p and os.path.exists(p) and not p.lower().endswith(('.mov', '.mp4', '.mkv')):
-                        paths.append(p)
-                    else:
-                        all_exist = False
-                        break
-                if all_exist and len(paths) == (end_f - start_f + 1):
-                    return paths, None
-            except Exception:
-                pass
-
-        # Fast temporary render via Write node in Nuke cache directory
         base_cache = get_nuke_cache_temp_dir()
         temp_dir = tempfile.mkdtemp(prefix="autoroto_frames_", dir=base_cache)
         pattern = os.path.join(temp_dir, "frame_%04d.jpg").replace("\\", "/")
@@ -273,7 +347,7 @@ class NukeRotoBridge:
             return False
 
         curves = roto_node['curves']
-        pts_info = self.extract_shape_points(raw_shape, ref_frame)
+        pts_info = self.extract_shape_points(raw_shape, ref_frame, roto_node=roto_node)
         if not pts_info:
             return False
 
@@ -405,9 +479,13 @@ class NukeRotoBridge:
                 tx = float(val[0])
                 ty = float(val[1])
 
-                # 1. Center gets absolute image coordinates
-                c_curve_x.addKey(f, tx)
-                c_curve_y.addKey(f, ty)
+                # Map global tracked screen coordinates back to local shape space at frame f
+                world_mat_f, is_ident_f = self.get_shape_world_transform(roto_node, raw_shape, float(f))
+                local_x, local_y = self.global_to_local_coords(tx, ty, world_mat_f, is_ident_f)
+
+                # 1. Center gets local shape coordinates
+                c_curve_x.addKey(f, local_x)
+                c_curve_y.addKey(f, local_y)
 
                 if keep_tangents:
                     # Calculate local rotation and gentle scale from tracked neighbors
@@ -824,10 +902,23 @@ def on_autoroto_knob_changed(node, knob):
 
 def create_autoroto_node():
     """
-    Creates a native Nuke Roto node equipped with AutoRoto as the first tab (Tab 1).
+    Creates a native Nuke Roto node equipped with AutoRoto as the first tab (Tab 1),
+    automatically synced to the input node format if connected.
     """
+    sel = None
+    try:
+        sel = nuke.selectedNode()
+    except Exception:
+        pass
+
     node = nuke.createNode('Roto')
     node.setName('AutoRoto1')
+    if sel:
+        try:
+            node.setInput(0, sel)
+            node['format'].setValue(sel.format().name())
+        except Exception:
+            pass
     setup_autoroto_knobs(node)
     hide_intermediate_native_tabs(node)
     make_autoroto_first_tab(node.name())
@@ -840,6 +931,11 @@ def add_autoroto_to_selected():
     """
     node = nuke.selectedNode()
     if node and node.Class() in ('Roto', 'RotoPaint'):
+        if node.input(0):
+            try:
+                node['format'].setValue(node.input(0).format().name())
+            except Exception:
+                pass
         setup_autoroto_knobs(node)
         hide_intermediate_native_tabs(node)
         make_autoroto_first_tab(node.name())
@@ -930,13 +1026,24 @@ def _run_tracking_for_range(roto_node, start_f: int, end_f: int, ref_f: int):
         nuke.message(f"Please connect video/footage to input of '{roto_node.name()}'.")
         return
 
+    # 1. Format Synchronization:
+    # Ensure Roto node's canvas format matches the input footage format exactly.
+    # Eliminates coordinate offsets, scaling discrepancies, and drifting.
+    try:
+        src_fmt = source_node.format()
+        roto_fmt = roto_node.format()
+        if roto_fmt.width() != src_fmt.width() or roto_fmt.height() != src_fmt.height():
+            roto_node['format'].setValue(src_fmt.name())
+    except Exception:
+        pass
+
     shape = get_target_shape(roto_node)
     if not shape:
         nuke.message(f"No shape found in '{roto_node.name()}'. Please draw a roto shape at frame {ref_f}.")
         return
 
     bridge = NukeRotoBridge()
-    pts_info = bridge.extract_shape_points(shape, ref_f)
+    pts_info = bridge.extract_shape_points(shape, ref_f, roto_node=roto_node)
     if not pts_info:
         nuke.message(f"Shape '{shape.name}' has no control points at frame {ref_f}.")
         return
@@ -1030,31 +1137,45 @@ def _run_tracking_for_range(roto_node, start_f: int, end_f: int, ref_f: int):
 
 
 def on_node_track_range(roto_node):
-    ref_f = int(roto_node['ar_ref_frame'].value())
+    curr_f = int(nuke.frame())
+    if roto_node.knob('ar_ref_frame'):
+        roto_node['ar_ref_frame'].setValue(curr_f)
+
     start_f = int(roto_node['ar_start_frame'].value())
     end_f = int(roto_node['ar_end_frame'].value())
     if start_f >= end_f:
         nuke.message("Start frame must be less than End frame.")
         return
+
+    # Anchor tracking at current frame; clamp if current frame is outside the range
+    ref_f = max(start_f, min(end_f, curr_f))
     _run_tracking_for_range(roto_node, start_f, end_f, ref_f)
 
 
 def on_node_track_to_end(roto_node):
-    ref_f = int(roto_node['ar_ref_frame'].value())
+    curr_f = int(nuke.frame())
+    if roto_node.knob('ar_ref_frame'):
+        roto_node['ar_ref_frame'].setValue(curr_f)
+
     end_f = int(roto_node['ar_end_frame'].value())
-    if ref_f >= end_f:
-        nuke.message("Reference frame must be less than End frame.")
+    if curr_f >= end_f:
+        nuke.message(f"Current frame ({curr_f}) is already at or beyond End frame ({end_f}).")
         return
-    _run_tracking_for_range(roto_node, ref_f, end_f, ref_f)
+
+    _run_tracking_for_range(roto_node, curr_f, end_f, curr_f)
 
 
 def on_node_track_to_start(roto_node):
-    ref_f = int(roto_node['ar_ref_frame'].value())
+    curr_f = int(nuke.frame())
+    if roto_node.knob('ar_ref_frame'):
+        roto_node['ar_ref_frame'].setValue(curr_f)
+
     start_f = int(roto_node['ar_start_frame'].value())
-    if start_f >= ref_f:
-        nuke.message("Start frame must be less than Reference frame.")
+    if curr_f <= start_f:
+        nuke.message(f"Current frame ({curr_f}) is already at or before Start frame ({start_f}).")
         return
-    _run_tracking_for_range(roto_node, start_f, ref_f, ref_f)
+
+    _run_tracking_for_range(roto_node, start_f, curr_f, curr_f)
 
 
 def on_node_track_step(roto_node, direction: int):
@@ -1062,11 +1183,14 @@ def on_node_track_step(roto_node, direction: int):
     key_step = max(1, key_step)
     step = direction * key_step
 
-    curr = int(nuke.frame())
-    target = curr + step
-    start_f = min(curr, target)
-    end_f = max(curr, target)
-    _run_tracking_for_range(roto_node, start_f, end_f, curr)
+    curr_f = int(nuke.frame())
+    if roto_node.knob('ar_ref_frame'):
+        roto_node['ar_ref_frame'].setValue(curr_f)
+
+    target = curr_f + step
+    start_f = min(curr_f, target)
+    end_f = max(curr_f, target)
+    _run_tracking_for_range(roto_node, start_f, end_f, curr_f)
     nuke.frame(target)
 
 
