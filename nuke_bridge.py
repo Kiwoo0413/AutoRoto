@@ -74,6 +74,108 @@ def get_nuke_cache_temp_dir() -> str:
     return fallback
 
 
+import re
+
+def detect_shape_keyframes(raw_shape) -> List[int]:
+    """
+    Scans control point animation curves of raw_shape and returns sorted unique keyframe numbers.
+    """
+    if not raw_shape:
+        return []
+    keyframes = set()
+    num_pts = len(raw_shape)
+    for i in range(num_pts):
+        pt = raw_shape[i]
+        c_curve_x = pt.center.getPositionAnimCurve(0)
+        c_curve_y = pt.center.getPositionAnimCurve(1)
+        if c_curve_x:
+            for k in c_curve_x.keys():
+                keyframes.add(int(round(k.x)))
+        if c_curve_y:
+            for k in c_curve_y.keys():
+                keyframes.add(int(round(k.x)))
+    return sorted(list(keyframes))
+
+
+def parse_keyframe_list_string(text: str) -> List[int]:
+    """
+    Parses comma- or whitespace-separated keyframe list string into sorted unique integers.
+    """
+    if not text or not str(text).strip():
+        return []
+    tokens = re.split(r'[,;\s]+', str(text).strip())
+    frames = set()
+    for tok in tokens:
+        if not tok:
+            continue
+        try:
+            frames.add(int(tok))
+        except ValueError:
+            pass
+    return sorted(list(frames))
+
+
+def blend_bidirectional_trajectories(
+    fwd_tracks: Dict[int, Dict[int, Tuple[float, float, float]]],
+    bwd_tracks: Dict[int, Dict[int, Tuple[float, float, float]]],
+    start_k: int,
+    end_k: int
+) -> Dict[int, Dict[int, Tuple[float, float, float]]]:
+    """
+    Blends forward and backward trajectories between keyframes start_k and end_k
+    using C1 smoothstep and CoTracker visibility weighting.
+    Boundary guarantee:
+      f == start_k -> exact fwd_tracks (100% match to start_k ground truth)
+      f == end_k   -> exact bwd_tracks (100% match to end_k ground truth)
+    """
+    blended = {}
+    span = end_k - start_k
+
+    all_pts = set(fwd_tracks.keys()).intersection(set(bwd_tracks.keys()))
+    for pt_idx in all_pts:
+        blended[pt_idx] = {}
+        pt_fwd = fwd_tracks[pt_idx]
+        pt_bwd = bwd_tracks[pt_idx]
+
+        for f in range(start_k, end_k + 1):
+            if f not in pt_fwd or f not in pt_bwd:
+                continue
+
+            xf, yf, vf = pt_fwd[f]
+            xb, yb, vb = pt_bwd[f]
+
+            if span <= 0:
+                blended[pt_idx][f] = (xf, yf, max(vf, vb))
+                continue
+
+            t = float(f - start_k) / float(span)
+            t = max(0.0, min(1.0, t))
+            # C1 smoothstep: s(0)=0, s(1)=1, s'(0)=0, s'(1)=0
+            s = 3.0 * (t ** 2) - 2.0 * (t ** 3)
+
+            w_a = (1.0 - s) * (max(0.0, float(vf)) + 0.05)
+            w_b = s * (max(0.0, float(vb)) + 0.05)
+            w_sum = w_a + w_b
+
+            if w_sum < 1e-6:
+                bx = 0.5 * (xf + xb)
+                by = 0.5 * (yf + yb)
+            else:
+                bx = (w_a * xf + w_b * xb) / w_sum
+                by = (w_a * yf + w_b * yb) / w_sum
+
+            # Exact boundary snap to guarantee 100% fidelity on ground truth keyframes
+            if f == start_k:
+                bx, by = xf, yf
+            elif f == end_k:
+                bx, by = xb, yb
+
+            b_vis = max(float(vf), float(vb))
+            blended[pt_idx][f] = (bx, by, b_vis)
+
+    return blended
+
+
 class NukeRotoBridge:
     """
     Bridge connecting Roto nodes directly to active Nuke session & CoTracker backend.
@@ -560,6 +662,220 @@ class NukeRotoBridge:
         curves.changed()
         return baked_count > 0
 
+    def bake_multi_ref_tracking_data_to_roto(
+        self,
+        roto_node,
+        raw_shape,
+        tracking_data: Dict[int, Dict[int, Tuple[float, float, float]]],
+        user_ref_frames: set,
+        keep_tangents: bool = True,
+        key_step: int = 1
+    ) -> bool:
+        """
+        Bakes multi-reference blended tracking data into Roto control point curves.
+        Guarantees that user's manual keyframes in user_ref_frames are 100% preserved
+        without being overwritten or deleted.
+        Intermediate in-between frames are filled with smoothly blended tracking data.
+        """
+        if not roto_node or not raw_shape:
+            return False
+
+        curves = roto_node['curves']
+        first_ref = sorted(list(user_ref_frames))[0] if user_ref_frames else int(nuke.frame())
+        pts_info = self.extract_shape_points(raw_shape, first_ref, roto_node=roto_node)
+        if not pts_info:
+            return False
+
+        num_pts = len(pts_info)
+
+        # Collect range across all tracked frames
+        all_frames = set()
+        for i_data in tracking_data.values():
+            all_frames.update(i_data.keys())
+        if not all_frames:
+            return False
+
+        min_f = min(all_frames)
+        max_f = max(all_frames)
+
+        bake_frames = set()
+        if key_step > 1:
+            for f in range(min_f, max_f + 1):
+                if (f - first_ref) % key_step == 0:
+                    bake_frames.add(f)
+            # Ensure boundaries are included
+            bake_frames.update(user_ref_frames)
+        else:
+            bake_frames = set(range(min_f, max_f + 1))
+
+        def _clean_curve_range_multi(curve, start_f, end_f, protected_frames):
+            if not curve:
+                return
+            try:
+                keys_to_remove = []
+                for k in list(curve.keys()):
+                    kf = int(round(k.x))
+                    if start_f <= kf <= end_f and kf not in protected_frames:
+                        keys_to_remove.append(k.x)
+                if keys_to_remove:
+                    curve.removeKey(keys_to_remove)
+            except Exception:
+                pass
+
+        is_open = False
+        if hasattr(raw_shape, 'getFlag'):
+            try:
+                is_open = bool(raw_shape.getFlag(5))  # eOpenFlag = 5
+            except Exception:
+                is_open = False
+
+        neighbors = {}
+        for i in range(num_pts):
+            if not is_open and num_pts >= 3:
+                prev_i = (i - 1) % num_pts
+                next_i = (i + 1) % num_pts
+            elif is_open and num_pts >= 2:
+                if i == 0:
+                    prev_i = 0
+                    next_i = 1
+                elif i == num_pts - 1:
+                    prev_i = num_pts - 2
+                    next_i = num_pts - 1
+                else:
+                    prev_i = i - 1
+                    next_i = i + 1
+            else:
+                prev_i = i
+                next_i = i
+            neighbors[i] = (prev_i, next_i)
+
+        baked_count = 0
+
+        for pt_data in pts_info:
+            i = pt_data['index']
+            if i not in tracking_data:
+                continue
+
+            raw_pt = pt_data['raw_point']
+            lt_dx, lt_dy = pt_data['lt_rel']
+            rt_dx, rt_dy = pt_data['rt_rel']
+            fc_dx, fc_dy = pt_data['fc_rel']
+
+            is_lt_zero = (abs(lt_dx) < 1e-3 and abs(lt_dy) < 1e-3)
+            is_rt_zero = (abs(rt_dx) < 1e-3 and abs(rt_dy) < 1e-3)
+            is_fc_zero = (abs(fc_dx) < 1e-3 and abs(fc_dy) < 1e-3)
+
+            c_curve_x = raw_pt.center.getPositionAnimCurve(0)
+            c_curve_y = raw_pt.center.getPositionAnimCurve(1)
+
+            lt_curve_x = raw_pt.leftTangent.getPositionAnimCurve(0)
+            lt_curve_y = raw_pt.leftTangent.getPositionAnimCurve(1)
+            rt_curve_x = raw_pt.rightTangent.getPositionAnimCurve(0)
+            rt_curve_y = raw_pt.rightTangent.getPositionAnimCurve(1)
+            fc_curve_x = raw_pt.featherCenter.getPositionAnimCurve(0)
+            fc_curve_y = raw_pt.featherCenter.getPositionAnimCurve(1)
+
+            if key_step > 1:
+                _clean_curve_range_multi(c_curve_x, min_f, max_f, user_ref_frames)
+                _clean_curve_range_multi(c_curve_y, min_f, max_f, user_ref_frames)
+                _clean_curve_range_multi(lt_curve_x, min_f, max_f, user_ref_frames)
+                _clean_curve_range_multi(lt_curve_y, min_f, max_f, user_ref_frames)
+                _clean_curve_range_multi(rt_curve_x, min_f, max_f, user_ref_frames)
+                _clean_curve_range_multi(rt_curve_y, min_f, max_f, user_ref_frames)
+                _clean_curve_range_multi(fc_curve_x, min_f, max_f, user_ref_frames)
+                _clean_curve_range_multi(fc_curve_y, min_f, max_f, user_ref_frames)
+
+            prev_i, next_i = neighbors[i]
+            p_prev_ref = (pts_info[prev_i]['x'], pts_info[prev_i]['y'])
+            p_next_ref = (pts_info[next_i]['x'], pts_info[next_i]['y'])
+            v0_x = p_next_ref[0] - p_prev_ref[0]
+            v0_y = p_next_ref[1] - p_prev_ref[1]
+            L0 = (v0_x**2 + v0_y**2) ** 0.5
+
+            for f, val in tracking_data[i].items():
+                if f not in bake_frames:
+                    continue
+                # RULE A3: If f is a user ground-truth keyframe, DO NOT OVERWRITE!
+                if f in user_ref_frames:
+                    continue
+
+                tx = float(val[0])
+                ty = float(val[1])
+
+                world_mat_f, is_ident_f = self.get_shape_world_transform(roto_node, raw_shape, float(f))
+                local_x, local_y = self.global_to_local_coords(tx, ty, world_mat_f, is_ident_f)
+
+                c_curve_x.addKey(f, local_x)
+                c_curve_y.addKey(f, local_y)
+
+                if keep_tangents:
+                    rot_cos = 1.0
+                    rot_sin = 0.0
+                    scale = 1.0
+
+                    if prev_i != next_i and L0 > 2.0:
+                        has_prev = (prev_i in tracking_data and f in tracking_data[prev_i])
+                        has_next = (next_i in tracking_data and f in tracking_data[next_i])
+                        if has_prev and has_next:
+                            p_prev_f = tracking_data[prev_i][f]
+                            p_next_f = tracking_data[next_i][f]
+                            vf_x = float(p_next_f[0]) - float(p_prev_f[0])
+                            vf_y = float(p_next_f[1]) - float(p_prev_f[1])
+                            Lf = (vf_x**2 + vf_y**2) ** 0.5
+                            if Lf > 2.0:
+                                rot_cos = (v0_x * vf_x + v0_y * vf_y) / (L0 * Lf)
+                                rot_sin = (v0_x * vf_y - v0_y * vf_x) / (L0 * Lf)
+                                raw_scale = Lf / L0
+                                scale = max(0.7, min(raw_scale, 1.4))
+
+                    m_xx = scale * rot_cos
+                    m_yx = scale * rot_sin
+
+                    if lt_curve_x and lt_curve_y:
+                        if is_lt_zero:
+                            lt_curve_x.addKey(f, 0.0)
+                            lt_curve_y.addKey(f, 0.0)
+                        else:
+                            lt_cur_x = m_xx * lt_dx - m_yx * lt_dy
+                            lt_cur_y = m_yx * lt_dx + m_xx * lt_dy
+                            lt_curve_x.addKey(f, float(lt_cur_x))
+                            lt_curve_y.addKey(f, float(lt_cur_y))
+
+                    if rt_curve_x and rt_curve_y:
+                        if is_rt_zero:
+                            rt_curve_x.addKey(f, 0.0)
+                            rt_curve_y.addKey(f, 0.0)
+                        else:
+                            rt_cur_x = m_xx * rt_dx - m_yx * rt_dy
+                            rt_cur_y = m_yx * rt_dx + m_xx * rt_dy
+                            rt_curve_x.addKey(f, float(rt_cur_x))
+                            rt_curve_y.addKey(f, float(rt_cur_y))
+
+                    if fc_curve_x and fc_curve_y:
+                        if is_fc_zero:
+                            fc_curve_x.addKey(f, 0.0)
+                            fc_curve_y.addKey(f, 0.0)
+                        else:
+                            fc_cur_x = m_xx * fc_dx - m_yx * fc_dy
+                            fc_cur_y = m_yx * fc_dx + m_xx * fc_dy
+                            fc_curve_x.addKey(f, float(fc_cur_x))
+                            fc_curve_y.addKey(f, float(fc_cur_y))
+                else:
+                    if lt_curve_x and lt_curve_y:
+                        lt_curve_x.addKey(f, 0.0)
+                        lt_curve_y.addKey(f, 0.0)
+                    if rt_curve_x and rt_curve_y:
+                        rt_curve_x.addKey(f, 0.0)
+                        rt_curve_y.addKey(f, 0.0)
+                    if fc_curve_x and fc_curve_y:
+                        fc_curve_x.addKey(f, 0.0)
+                        fc_curve_y.addKey(f, 0.0)
+
+            baked_count += 1
+
+        curves.changed()
+        return baked_count > 0
+
 
 # =========================================================================
 # Tracker-Style Knobs Setup for Native Roto Nodes
@@ -753,6 +1069,40 @@ def setup_autoroto_knobs(node):
             )
             btn_toggle_tabs.setTooltip('Toggle extra native tabs (Transform, Motion Blur, Shape, Clone, Lifetime, Tracking) visibility.')
             node.addKnob(btn_toggle_tabs)
+        if not node.knob('ar_multiref_list'):
+            node.addKnob(nuke.Text_Knob('ar_div_multiref', '<font size=3 color="#00e5ff"><b>Multi-Reference Tracking</b></font>'))
+            btn_detect_keys = nuke.PyScript_Knob(
+                'ar_detect_keys', 'Detect Shape Keys',
+                'import nuke_bridge; nuke_bridge.on_node_detect_keyframes(nuke.thisNode())'
+            )
+            btn_detect_keys.setTooltip('Automatically scans active Roto shape to detect all existing user-modified keyframe frames.')
+            btn_add_curr_ref = nuke.PyScript_Knob(
+                'ar_add_curr_ref', '+ Add Current',
+                'import nuke_bridge; nuke_bridge.on_node_add_current_ref(nuke.thisNode())'
+            )
+            btn_add_curr_ref.setTooltip('Adds the current playhead frame to the multi-reference keyframe list.')
+            btn_clear_multiref = nuke.PyScript_Knob(
+                'ar_clear_multiref', 'Clear',
+                'import nuke_bridge; nuke_bridge.on_node_clear_multiref(nuke.thisNode())'
+            )
+            btn_clear_multiref.setTooltip('Clears the multi-reference keyframe list.')
+            btn_track_multiref = nuke.PyScript_Knob(
+                'ar_track_multiref', '<b><font color="#00e5ff">⚡ Track Multi-Reference</font></b>',
+                'import nuke_bridge; nuke_bridge.on_node_track_multi_ref(nuke.thisNode())'
+            )
+            btn_track_multiref.setTooltip('Executes bidirectional AI tracking across all reference keyframes. 100% preserves your manual keyframes while filling in-between frames with seamless visibility-weighted tracking.')
+            btn_detect_keys.setFlag(nuke.STARTLINE)
+            btn_add_curr_ref.clearFlag(nuke.STARTLINE)
+            btn_clear_multiref.clearFlag(nuke.STARTLINE)
+            btn_track_multiref.clearFlag(nuke.STARTLINE)
+            node.addKnob(btn_detect_keys)
+            node.addKnob(btn_add_curr_ref)
+            node.addKnob(btn_clear_multiref)
+            node.addKnob(btn_track_multiref)
+            k_multiref_list = nuke.String_Knob('ar_multiref_list', 'Keyframes')
+            k_multiref_list.setValue('')
+            k_multiref_list.setTooltip('Comma-separated list of reference keyframe numbers (e.g. "1, 35, 70, 100"). Leave blank to auto-detect from the shape.')
+            node.addKnob(k_multiref_list)
         hide_intermediate_native_tabs(node)
         make_autoroto_first_tab(node.name())
         return
@@ -871,7 +1221,49 @@ def setup_autoroto_knobs(node):
     btn_fix_tangents.setTooltip('Cleans corrupted Bezier tangent handles and restores crisp curvature matching reference frame, instantly eliminating loops.')
     node.addKnob(btn_fix_tangents)
 
-    # 6. Utilities & Status
+    # 6. Multi-Reference Tracking Section
+    node.addKnob(nuke.Text_Knob('ar_div_multiref', '<font size=3 color="#00e5ff"><b>Multi-Reference Tracking</b></font>'))
+
+    btn_detect_keys = nuke.PyScript_Knob(
+        'ar_detect_keys', 'Detect Shape Keys',
+        'import nuke_bridge; nuke_bridge.on_node_detect_keyframes(nuke.thisNode())'
+    )
+    btn_detect_keys.setTooltip('Automatically scans active Roto shape to detect all existing user-modified keyframe frames.')
+
+    btn_add_curr_ref = nuke.PyScript_Knob(
+        'ar_add_curr_ref', '+ Add Current',
+        'import nuke_bridge; nuke_bridge.on_node_add_current_ref(nuke.thisNode())'
+    )
+    btn_add_curr_ref.setTooltip('Adds the current playhead frame to the multi-reference keyframe list.')
+
+    btn_clear_multiref = nuke.PyScript_Knob(
+        'ar_clear_multiref', 'Clear',
+        'import nuke_bridge; nuke_bridge.on_node_clear_multiref(nuke.thisNode())'
+    )
+    btn_clear_multiref.setTooltip('Clears the multi-reference keyframe list.')
+
+    btn_track_multiref = nuke.PyScript_Knob(
+        'ar_track_multiref', '<b><font color="#00e5ff">⚡ Track Multi-Reference</font></b>',
+        'import nuke_bridge; nuke_bridge.on_node_track_multi_ref(nuke.thisNode())'
+    )
+    btn_track_multiref.setTooltip('Executes bidirectional AI tracking across all reference keyframes. 100% preserves your manual keyframes while filling in-between frames with seamless visibility-weighted tracking.')
+
+    btn_detect_keys.setFlag(nuke.STARTLINE)
+    btn_add_curr_ref.clearFlag(nuke.STARTLINE)
+    btn_clear_multiref.clearFlag(nuke.STARTLINE)
+    btn_track_multiref.clearFlag(nuke.STARTLINE)
+
+    node.addKnob(btn_detect_keys)
+    node.addKnob(btn_add_curr_ref)
+    node.addKnob(btn_clear_multiref)
+    node.addKnob(btn_track_multiref)
+
+    k_multiref_list = nuke.String_Knob('ar_multiref_list', 'Keyframes')
+    k_multiref_list.setValue('')
+    k_multiref_list.setTooltip('Comma-separated list of reference keyframe numbers (e.g. "1, 35, 70, 100"). Leave blank to auto-detect from the shape.')
+    node.addKnob(k_multiref_list)
+
+    # 7. Utilities & Status
     node.addKnob(nuke.Text_Knob('ar_div2', ''))
 
     k_check_gpu = nuke.PyScript_Knob(
@@ -1204,9 +1596,340 @@ def on_node_track_step(roto_node, direction: int):
     nuke.frame(target)
 
 
+# =========================================================================
+# Multi-Reference Tracking Event Handlers & Core Runner
+# =========================================================================
+
+def on_node_detect_keyframes(roto_node):
+    """
+    Detects all keyframes created by the user on the active Roto shape
+    and populates the 'Keyframes' field.
+    """
+    shape = get_target_shape(roto_node)
+    if not shape:
+        nuke.message(f"No shape found in '{roto_node.name()}'. Please draw or select a roto shape first.")
+        return
+
+    detected = detect_shape_keyframes(shape)
+    if not detected:
+        curr = int(nuke.frame())
+        msg = f"No keyframes detected on shape '{shape.name}'. Defaulted to current frame {curr}."
+        if roto_node.knob('ar_multiref_list'):
+            roto_node['ar_multiref_list'].setValue(str(curr))
+        if roto_node.knob('ar_status'):
+            roto_node['ar_status'].setValue(msg)
+        nuke.message(f"AutoRoto: {msg}")
+        return
+
+    frames_str = ", ".join(str(k) for k in detected)
+    if roto_node.knob('ar_multiref_list'):
+        roto_node['ar_multiref_list'].setValue(frames_str)
+    msg = f"Detected {len(detected)} shape keyframes: {frames_str}"
+    if roto_node.knob('ar_status'):
+        roto_node['ar_status'].setValue(msg)
+    nuke.message(f"AutoRoto: {msg}")
+
+
+def on_node_add_current_ref(roto_node):
+    """
+    Adds current playhead frame to the multi-reference keyframe list.
+    """
+    curr = int(nuke.frame())
+    existing_text = roto_node['ar_multiref_list'].value() if roto_node.knob('ar_multiref_list') else ""
+    frames = parse_keyframe_list_string(existing_text)
+    if curr not in frames:
+        frames.append(curr)
+        frames.sort()
+    frames_str = ", ".join(str(k) for k in frames)
+    if roto_node.knob('ar_multiref_list'):
+        roto_node['ar_multiref_list'].setValue(frames_str)
+    msg = f"Added frame {curr} to multi-reference list: {frames_str}"
+    if roto_node.knob('ar_status'):
+        roto_node['ar_status'].setValue(msg)
+
+
+def on_node_clear_multiref(roto_node):
+    """
+    Clears the multi-reference keyframe list.
+    """
+    if roto_node.knob('ar_multiref_list'):
+        roto_node['ar_multiref_list'].setValue("")
+    msg = "Cleared multi-reference keyframe list."
+    if roto_node.knob('ar_status'):
+        roto_node['ar_status'].setValue(msg)
+
+
+def _run_multi_reference_tracking(roto_node, ref_frames: List[int], start_f: int, end_f: int):
+    """
+    Core execution engine for Multi-Reference Bidirectional AI Tracking.
+    Runs forward and backward CoTracker3 GPU tracking between reference keyframes,
+    blends trajectories with C1 smoothstep and visibility weights, and bakes into Roto
+    while 100% preserving artist ground truth keyframes.
+    """
+    source_node = roto_node.input(0)
+    if not source_node:
+        nuke.message(f"Please connect video/footage to input of '{roto_node.name()}'.")
+        return
+
+    # 1. Format Synchronization
+    try:
+        src_fmt = source_node.format()
+        roto_fmt = roto_node.format()
+        if roto_fmt.width() != src_fmt.width() or roto_fmt.height() != src_fmt.height():
+            roto_node['format'].setValue(src_fmt.name())
+    except Exception:
+        pass
+
+    shape = get_target_shape(roto_node)
+    if not shape:
+        nuke.message(f"No shape found in '{roto_node.name()}'. Please draw or select a roto shape first.")
+        return
+
+    ref_frames = sorted(list(set(ref_frames)))
+    if not ref_frames:
+        nuke.message("No reference frames specified or detected.")
+        return
+
+    # If only 1 reference frame, delegate directly to standard tracking anchored at that frame
+    if len(ref_frames) == 1:
+        _run_tracking_for_range(roto_node, start_f, end_f, ref_frames[0])
+        return
+
+    bridge = NukeRotoBridge()
+    first_ref = ref_frames[0]
+    pts_info = bridge.extract_shape_points(shape, first_ref, roto_node=roto_node)
+    if not pts_info:
+        nuke.message(f"Shape '{shape.name}' has no control points at frame {first_ref}.")
+        return
+
+    # Determine global span across timeline and all reference keys
+    min_needed = min(start_f, ref_frames[0])
+    max_needed = max(end_f, ref_frames[-1])
+    total_frames = max_needed - min_needed + 1
+
+    # Resolution downscaling configuration
+    res_val = roto_node['ar_resolution'].value() if roto_node.knob('ar_resolution') else '720p'
+    if '720' in res_val:
+        max_size = 720
+    elif '960' in res_val:
+        max_size = 960
+    else:
+        max_size = 0  # Full native resolution
+
+    # Calculate total tracking passes
+    num_intervals = len(ref_frames) - 1
+    total_passes = (1 if min_needed < ref_frames[0] else 0) + (2 * num_intervals) + (1 if max_needed > ref_frames[-1] else 0)
+
+    progress = nuke.ProgressTask(f"AutoRoto: Multi-Reference Tracking ({len(ref_frames)} keys, {total_passes} passes)...")
+    progress.setProgress(5)
+    progress.setMessage(f"Exporting {total_frames} frames from Nuke...")
+
+    temp_dir = None
+    try:
+        image_paths, temp_dir = bridge.export_source_frames(source_node, min_needed, max_needed)
+        if progress.isCancelled():
+            raise RuntimeError("Tracking cancelled by user.")
+
+        cache_base = get_nuke_cache_temp_dir()
+        master_tracks: Dict[int, Dict[int, Tuple[float, float, float]]] = {p['index']: {} for p in pts_info}
+        pass_counter = [0]
+
+        def make_pass_callback(label):
+            idx = pass_counter[0]
+            p_start = 12.0 + (float(idx) / float(max(1, total_passes))) * 78.0
+            p_width = 78.0 / float(max(1, total_passes))
+            def cb(pct: float, msg: str):
+                if progress.isCancelled():
+                    raise RuntimeError("Tracking cancelled by user.")
+                overall = int(p_start + (pct / 100.0) * p_width)
+                progress.setProgress(overall)
+                progress.setMessage(f"[{idx+1}/{total_passes}] {label}: {msg}")
+            return cb
+
+        # 1. Pre-interval (if min_needed < ref_frames[0]): track backward from ref_frames[0]
+        if min_needed < ref_frames[0]:
+            k1 = ref_frames[0]
+            sub_paths = image_paths[0 : k1 - min_needed + 1]
+            pts_at_k1 = bridge.extract_shape_points(shape, k1, roto_node=roto_node)
+            rel_t = float(k1 - min_needed)
+            queries = [{"index": p["index"], "t": rel_t, "x": float(p["x"]), "y": float(p["y"])} for p in pts_at_k1]
+            cb = make_pass_callback(f"Pre-range ({k1} ➔ {min_needed})")
+            pass_counter[0] += 1
+
+            pre_tracks = tracker_core.run_cotracker_point_tracking(
+                image_paths=sub_paths,
+                queries=queries,
+                start_frame=min_needed,
+                max_size=max_size,
+                chunk_size=100,
+                progress_callback=cb,
+                temp_dir_base=cache_base
+            )
+            for pt_idx, f_map in pre_tracks.items():
+                if pt_idx not in master_tracks:
+                    master_tracks[pt_idx] = {}
+                for f, val in f_map.items():
+                    if f <= k1:
+                        master_tracks[pt_idx][f] = val
+
+        # 2. In-between intervals: bidirectional forward + backward tracking and blending
+        for j in range(num_intervals):
+            ka = ref_frames[j]
+            kb = ref_frames[j + 1]
+            if ka >= kb:
+                continue
+
+            sub_paths = image_paths[ka - min_needed : kb - min_needed + 1]
+            pts_ka = bridge.extract_shape_points(shape, ka, roto_node=roto_node)
+            pts_kb = bridge.extract_shape_points(shape, kb, roto_node=roto_node)
+
+            # 2a. Forward tracking from ka to kb
+            q_fwd = [{"index": p["index"], "t": 0.0, "x": float(p["x"]), "y": float(p["y"])} for p in pts_ka]
+            cb_fwd = make_pass_callback(f"Interval {ka}➔{kb} (Forward)")
+            pass_counter[0] += 1
+            fwd_tracks = tracker_core.run_cotracker_point_tracking(
+                image_paths=sub_paths,
+                queries=q_fwd,
+                start_frame=ka,
+                max_size=max_size,
+                chunk_size=100,
+                progress_callback=cb_fwd,
+                temp_dir_base=cache_base
+            )
+
+            # 2b. Backward tracking from kb to ka
+            q_bwd = [{"index": p["index"], "t": float(kb - ka), "x": float(p["x"]), "y": float(p["y"])} for p in pts_kb]
+            cb_bwd = make_pass_callback(f"Interval {ka}➔{kb} (Backward)")
+            pass_counter[0] += 1
+            bwd_tracks = tracker_core.run_cotracker_point_tracking(
+                image_paths=sub_paths,
+                queries=q_bwd,
+                start_frame=ka,
+                max_size=max_size,
+                chunk_size=100,
+                progress_callback=cb_bwd,
+                temp_dir_base=cache_base
+            )
+
+            # 2c. Seamless C1 smoothstep & visibility weighted blending
+            blended_interval = blend_bidirectional_trajectories(fwd_tracks, bwd_tracks, ka, kb)
+            for pt_idx, f_map in blended_interval.items():
+                if pt_idx not in master_tracks:
+                    master_tracks[pt_idx] = {}
+                for f, val in f_map.items():
+                    master_tracks[pt_idx][f] = val
+
+        # 3. Post-interval (if max_needed > ref_frames[-1]): track forward from ref_frames[-1]
+        if max_needed > ref_frames[-1]:
+            km = ref_frames[-1]
+            sub_paths = image_paths[km - min_needed : max_needed - min_needed + 1]
+            pts_km = bridge.extract_shape_points(shape, km, roto_node=roto_node)
+            queries = [{"index": p["index"], "t": 0.0, "x": float(p["x"]), "y": float(p["y"])} for p in pts_km]
+            cb_post = make_pass_callback(f"Post-range ({km} ➔ {max_needed})")
+            pass_counter[0] += 1
+
+            post_tracks = tracker_core.run_cotracker_point_tracking(
+                image_paths=sub_paths,
+                queries=queries,
+                start_frame=km,
+                max_size=max_size,
+                chunk_size=100,
+                progress_callback=cb_post,
+                temp_dir_base=cache_base
+            )
+            for pt_idx, f_map in post_tracks.items():
+                if pt_idx not in master_tracks:
+                    master_tracks[pt_idx] = {}
+                for f, val in f_map.items():
+                    if f >= km:
+                        master_tracks[pt_idx][f] = val
+
+        if progress.isCancelled():
+            raise RuntimeError("Tracking cancelled by user.")
+
+        progress.setProgress(93)
+        progress.setMessage("Baking blended tracking data into Roto curves...")
+
+        keep_tg = bool(roto_node['ar_keep_tangents'].value()) if roto_node.knob('ar_keep_tangents') else True
+        key_step = int(roto_node['ar_key_step'].value()) if roto_node.knob('ar_key_step') else 1
+        key_step = max(1, key_step)
+
+        ok = bridge.bake_multi_ref_tracking_data_to_roto(
+            roto_node=roto_node,
+            raw_shape=shape,
+            tracking_data=master_tracks,
+            user_ref_frames=set(ref_frames),
+            keep_tangents=keep_tg,
+            key_step=key_step
+        )
+
+        progress.setProgress(100)
+        if ok:
+            step_info = f" (Key Step: {key_step})" if key_step > 1 else ""
+            res_info = f" [{max_size}p]" if max_size > 0 else " [Full Res]"
+            ref_str = ", ".join(str(k) for k in ref_frames)
+            msg = f"✓ Multi-Reference Tracked {len(pts_info)} pts across {len(ref_frames)} keys [{ref_str}]{step_info}{res_info}!"
+            if roto_node.knob('ar_status'):
+                roto_node.knob('ar_status').setValue(msg)
+            nuke.message(f"AutoRoto: Complete!\nMulti-Reference tracking baked across {len(ref_frames)} anchor keyframes ({min_needed}-{max_needed}).\nUser keyframes [{ref_str}] 100% preserved.")
+        else:
+            if roto_node.knob('ar_status'):
+                roto_node.knob('ar_status').setValue("Multi-Reference bake failed.")
+
+    except Exception as e:
+        err_msg = str(e)
+        if "cancelled" in err_msg.lower():
+            if roto_node.knob('ar_status'):
+                roto_node.knob('ar_status').setValue("Multi-Reference tracking cancelled.")
+            nuke.message("AutoRoto: Multi-Reference tracking was cancelled.")
+        else:
+            if roto_node.knob('ar_status'):
+                roto_node.knob('ar_status').setValue(f"Error: {err_msg}")
+            nuke.message(f"AutoRoto Error:\n{err_msg}")
+
+    finally:
+        del progress
+        if temp_dir and os.path.exists(temp_dir):
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+def on_node_track_multi_ref(roto_node):
+    """
+    Callback when user clicks '⚡ Track Multi-Reference'.
+    Reads keyframe list (or auto-detects from shape), validates, and executes multi-reference tracking.
+    """
+    raw_text = roto_node['ar_multiref_list'].value() if roto_node.knob('ar_multiref_list') else ""
+    ref_frames = parse_keyframe_list_string(raw_text)
+
+    shape = get_target_shape(roto_node)
+    if not shape:
+        nuke.message(f"No shape found in '{roto_node.name()}'. Please draw or select a roto shape first.")
+        return
+
+    # If list is empty, auto-detect from shape curves
+    if not ref_frames:
+        ref_frames = detect_shape_keyframes(shape)
+        if ref_frames:
+            frames_str = ", ".join(str(k) for k in ref_frames)
+            if roto_node.knob('ar_multiref_list'):
+                roto_node['ar_multiref_list'].setValue(frames_str)
+
+    if not ref_frames:
+        curr = int(nuke.frame())
+        ref_frames = [curr]
+        if roto_node.knob('ar_multiref_list'):
+            roto_node['ar_multiref_list'].setValue(str(curr))
+
+    start_f = int(roto_node['ar_start_frame'].value()) if roto_node.knob('ar_start_frame') else int(nuke.root()['first_frame'].value())
+    end_f = int(roto_node['ar_end_frame'].value()) if roto_node.knob('ar_end_frame') else int(nuke.root()['last_frame'].value())
+
+    _run_multi_reference_tracking(roto_node, ref_frames, start_f, end_f)
+
+
 # Automatically apply tab move & VCR button sizing if Nuke GUI session is active
 if QtWidgets and QtWidgets.QApplication.instance():
     try:
         make_autoroto_first_tab()
     except Exception:
         pass
+

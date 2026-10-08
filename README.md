@@ -77,6 +77,7 @@ AutoRoto는 Nuke 내장 파이썬과 충돌하지 않도록 외부 Python의 PyT
 ├── tracker_core.py            # CoTracker 3 GPU 딥러닝 트래커 (100프레임 청크, 실시간 스트리밍, 다운스케일)
 ├── test_cotracker_backend.py  # 단위 테스트 스위트
 ├── test_tangent_math.py       # 탄젠트 수학 및 키 스텝 검증 테스트
+├── test_multi_ref_tracking.py # 멀티 레퍼런스 양방향 블렌딩 및 키프레임 보존 검증 테스트
 ├── README.md                  # 사용자 매뉴얼
 └── SCRIPT_STRUCTURE.md        # 아키텍처 및 내부 구조 상세 문서
 ```
@@ -116,3 +117,17 @@ AutoRoto는 Nuke 내장 파이썬과 충돌하지 않도록 외부 Python의 PyT
 - 이미 셰이프를 따 둔 일반 Roto 노드가 있다면:
   - 해당 Roto 노드를 선택하고 Nuke 상단 메뉴: **`AutoRoto` ➔ `Convert Selected Roto to AutoRoto`** 클릭.
   - 기존 셰이프와 점을 그대로 유지한 채 1번 탭에 AutoRoto 트래커 기능이 즉시 추가됩니다.
+
+### 방법 C: 멀티 레퍼런스 트래킹 (Multi-Reference Tracking)
+
+여러 프레임에서 로토 셰이프를 수정하거나 키프레임을 잡은 경우, 이를 복수 앵커(Multi-Reference)로 활용하여 사이 구간을 완벽하게 보간 추적할 수 있습니다:
+
+1. **키프레임 감지 / 등록**:
+   - **`[Detect Shape Keys]`**: 활성 로토 셰이프의 애니메이션 커브를 자동 스캔하여 아티스트가 직접 생성/수정한 모든 키프레임 번호(예: `1, 35, 70, 100`)를 자동 탐지하여 `Keyframes` 입력 필드에 등록합니다.
+   - **`[+ Add Current]`**: 현재 플레이헤드 프레임을 멀티 레퍼런스 키 목록에 즉시 추가합니다.
+   - **`[Clear]`**: 키프레임 목록을 초기화합니다.
+2. **`[⚡ Track Multi-Reference]` 실행**:
+   - 각 키프레임 구간(예: 1~35, 35~70, 70~100) 사이에서 **순방향(Forward) 및 역방향(Backward) CoTracker 3 양방향 추적**을 각각 수행합니다.
+   - $C^1$ Smoothstep ($s(t) = 3t^2 - 2t^3$) 및 CoTracker Feature Visibility(가시성) 가중치를 결합하여 두 궤적을 무봉제(Seamless)로 블렌딩합니다.
+   - **아티스트 키프레임 100% 보존**: 사용자가 직접 작업한 기준 키프레임은 일절 덮어쓰거나 지우지 않고 그대로 유지되며, 오직 사이 구간(In-between)의 프레임들만 최적의 트래킹 데이터로 채워집니다.
+
