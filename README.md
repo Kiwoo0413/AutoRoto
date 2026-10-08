@@ -1,7 +1,11 @@
 # AutoRoto (v2.1) - Roto Node with Tracker Buttons & CoTracker GPU
+>
 > **Nuke 네이티브 Roto 노드 복제 + 트래커 VCR 버튼 탑재**: Nuke Roto 노드에 트래커 노드의 트래킹 버튼들을 그대로 탑재하고, Meta CoTracker 3 GPU 백엔드로 구동되는 혁신적인 로토 툴킷
 
+<https://github.com/user-attachments/assets/3fdd6cf2-98cc-49c6-ae54-dacb82a579e3>
+
 ### 🖥️ 지원 환경 및 호환 버전 (Compatibility)
+
 - **지원 Nuke 버전**: **Foundry Nuke 13.0 ~ 17.x+** *(Nuke 13, 14, 15, 16, 17 전 버전 완벽 호환)*
 - **UI 방식**: **100% 네이티브 Roto 노드 일체형** (별도 PySide 창 불필요, Roto 1번 탭 직접 제어)
 - **운영체제(OS)**: Windows 10/11, Linux (Rocky, CentOS, Ubuntu)
@@ -24,24 +28,32 @@
 ## 📥 2. 설치 방법 (Installation)
 
 ### 1) GitHub 저장소 다운로드 / 클론
+
 Nuke의 사용자 플러그인 디렉터리(`~/.nuke/`)에 저장소를 클론하거나 압축 해제합니다:
+
 ```bash
 cd ~/.nuke
 git clone https://github.com/Kiwoo0413/AutoRoto.git
 ```
+
 *(폴더명이 반드시 `AutoRoto`여야 합니다.)*
 
 ### 2) Nuke `init.py` 경로 등록
+
 `~/.nuke/init.py` 파일(없으면 새로 생성)을 열고 아래 1줄을 추가합니다:
+
 ```python
 import nuke
 nuke.pluginAddPath('AutoRoto')
 ```
 
 ### 3) 외부 Python & AI 백엔드 환경 준비
+
 AutoRoto는 Nuke 내장 파이썬과 충돌하지 않도록 외부 Python의 PyTorch + CUDA 환경을 사용합니다.
+
 - **Python 버전**: 3.10 ~ 3.12 (Windows / Linux)
 - **필수 패키지 설치**:
+
   ```bash
   # CUDA 지원 PyTorch 설치 (예: CUDA 12.4)
   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
@@ -50,6 +62,7 @@ AutoRoto는 Nuke 내장 파이썬과 충돌하지 않도록 외부 Python의 PyT
   # (선택) CoTracker 패키지 설치 (미설치 시 torch.hub를 통해 모델 자동 로드)
   pip install git+https://github.com/facebookresearch/co-tracker.git
   ```
+
 - *참고*: 가상환경(Conda)이나 특정 경로의 Python을 사용하고 싶다면 시스템 환경 변수 `AUTOROTO_PYTHON`에 해당 `python.exe`의 절대 경로를 지정하시면 우선적으로 인식됩니다.
 
 ---
@@ -73,6 +86,7 @@ AutoRoto는 Nuke 내장 파이썬과 충돌하지 않도록 외부 Python의 PyT
 ## 🖥️ 4. 사용 방법 (Nuke)
 
 ### 방법 A: AutoRoto 노드 신규 생성 (권장)
+
 1. **노드 생성**:
    - 노드 그래프에서 `Tab` 키를 누르고 **`AutoRoto`** 입력 (또는 단축키 **`Ctrl+Alt+R`**, 또는 노드 툴바의 **AutoRoto** 아이콘 클릭).
    - 생성되는 노드는 **100% 네이티브 Roto 노드**이므로 뷰어의 모든 펜/베지어 툴이 그대로 동작합니다.
@@ -98,6 +112,7 @@ AutoRoto는 Nuke 내장 파이썬과 충돌하지 않도록 외부 Python의 PyT
    - 실시간 진행률 바를 통해 청크별 진행 상황이 표시되며, 언제든 `Cancel`로 안전하게 즉시 중단할 수 있습니다.
 
 ### 방법 B: 기존에 작업 중이던 Roto 노드에 트래커 버튼 추가
+
 - 이미 셰이프를 따 둔 일반 Roto 노드가 있다면:
   - 해당 Roto 노드를 선택하고 Nuke 상단 메뉴: **`AutoRoto` ➔ `Convert Selected Roto to AutoRoto`** 클릭.
   - 기존 셰이프와 점을 그대로 유지한 채 1번 탭에 AutoRoto 트래커 기능이 즉시 추가됩니다.

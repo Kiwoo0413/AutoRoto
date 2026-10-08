@@ -640,10 +640,11 @@ def toggle_native_roto_tabs(node):
         node.knob('ar_status').setValue(f"Extra tabs {state_text}.")
 
 
-def make_autoroto_first_tab(node_name: Optional[str] = None):
+def make_autoroto_first_tab(node_name: Optional[str] = None, focus: bool = False):
     """
-    1. Moves the AutoRoto tab to the 1st position (index 0) in the Properties panel and focuses it.
-    2. Adjusts VCR button sizes (|◀, ◀, ▶, ▶|) to compact width (34px) matching symbol size.
+    1. Moves the AutoRoto tab to the 1st position (index 0) in the Properties panel.
+    2. Focuses it only if focus=True.
+    3. Adjusts VCR button sizes (|◀, ◀, ▶, ▶|) to compact width (34px) matching symbol size.
     """
     if not QtWidgets:
         return
@@ -655,7 +656,7 @@ def make_autoroto_first_tab(node_name: Optional[str] = None):
         if not app:
             return
         for w in app.allWidgets():
-            # Tab bar: focus AutoRoto as Tab 1
+            # Tab bar: move AutoRoto to Tab 1 (index 0)
             if isinstance(w, QtWidgets.QTabBar):
                 try:
                     count = w.count()
@@ -668,7 +669,8 @@ def make_autoroto_first_tab(node_name: Optional[str] = None):
                     if auto_idx != -1:
                         if auto_idx != 0:
                             w.moveTab(auto_idx, 0)
-                        w.setCurrentIndex(0)
+                        if focus:
+                            w.setCurrentIndex(0)
                 except Exception:
                     pass
 
@@ -691,11 +693,19 @@ def make_autoroto_first_tab(node_name: Optional[str] = None):
 
 def on_node_knob_changed(node, knob):
     """
-    Listens for panel events to guarantee AutoRoto remains Tab 1 and VCR buttons remain compact.
+    Listens for panel events.
+    Only triggers tab adjustment and initial focus when the node's properties panel is opened ('showPanel').
+    Ignores button clicks and parameter changes so users can work in other tabs (e.g. Roto) uninterrupted.
     """
-    if not node:
+    if not node or not knob:
         return
-    make_autoroto_first_tab(node.name())
+    try:
+        knob_name = knob.name()
+    except Exception:
+        return
+
+    if knob_name == 'showPanel':
+        make_autoroto_first_tab(node.name(), focus=True)
 
 
 def setup_autoroto_knobs(node):
@@ -921,7 +931,7 @@ def create_autoroto_node():
             pass
     setup_autoroto_knobs(node)
     hide_intermediate_native_tabs(node)
-    make_autoroto_first_tab(node.name())
+    make_autoroto_first_tab(node.name(), focus=True)
     return node
 
 
@@ -938,7 +948,7 @@ def add_autoroto_to_selected():
                 pass
         setup_autoroto_knobs(node)
         hide_intermediate_native_tabs(node)
-        make_autoroto_first_tab(node.name())
+        make_autoroto_first_tab(node.name(), focus=True)
         nuke.message(f"Added AutoRoto as Tab 1 on '{node.name()}'!")
     else:
         nuke.message("Please select a Roto or RotoPaint node first.")
