@@ -222,6 +222,27 @@ class TestMultiRefTracking(unittest.TestCase):
         self.assertEqual(master_tracks[0][40], (50.0, 50.0, 1.0))
         self.assertEqual(master_tracks[0][60], (90.0, 90.0, 1.0))
 
+    def test_unified_ref_frame_routing(self):
+        # 1 frame -> single tracking mode
+        frames_1 = parse_keyframe_list_string("42")
+        self.assertEqual(len(frames_1), 1)
+        self.assertEqual(frames_1, [42])
+
+        # 2+ frames -> multi-reference tracking mode
+        frames_multi = parse_keyframe_list_string("10, 45, 90")
+        self.assertEqual(len(frames_multi), 3)
+        self.assertEqual(frames_multi, [10, 45, 90])
+
+        # Add current frame logic
+        curr = 60
+        combined = sorted(list(set(frames_1 + [curr])))
+        self.assertEqual(combined, [42, 60])
+        self.assertGreaterEqual(len(combined), 2)
+
+        # Clear logic
+        cleared = parse_keyframe_list_string("")
+        self.assertEqual(len(cleared), 0)
+
 if __name__ == '__main__':
     unittest.main()
 

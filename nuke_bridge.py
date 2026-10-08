@@ -1029,16 +1029,18 @@ def setup_autoroto_knobs(node):
     Equips a native Roto node with Tracker-style VCR buttons & CoTracker controls.
     Arranges AutoRoto as the first tab (Tab 1).
     """
-    # 0. Clean up obsolete duplicated Roto settings knobs if present
-    old_roto_knobs = [
+    # 0. Clean up obsolete duplicated / deprecated knobs if present
+    deprecated_knobs = [
         'ar_div_roto', 'ar_output', 'ar_premultiply', 'ar_cliptype',
         'ar_replace', 'ar_opacity', 'ar_feather', 'ar_feather_falloff', 'ar_feather_type',
-        'ar_open_panel'
+        'ar_open_panel',
+        'ar_div_multiref', 'ar_detect_keys', 'ar_add_curr_ref', 'ar_clear_multiref',
+        'ar_track_multiref', 'ar_multiref_list', 'ar_set_curr'
     ]
-    for ok in old_roto_knobs:
-        if node.knob(ok):
+    for dk in deprecated_knobs:
+        if node.knob(dk):
             try:
-                node.removeKnob(node.knob(ok))
+                node.removeKnob(node.knob(dk))
             except Exception:
                 pass
 
@@ -1046,63 +1048,45 @@ def setup_autoroto_knobs(node):
     if node.knob('AutoRotoTrackerTab'):
         node.knob('AutoRotoTrackerTab').setLabel('AutoRoto')
 
-    # If tab already exists, ensure key_step and resolution are present and tabs are arranged
-    if node.knob('AutoRoto') or node.knob('AutoRotoTrackerTab'):
-        if not node.knob('ar_key_step'):
-            k_step = nuke.Int_Knob('ar_key_step', 'Key Step')
-            k_step.setValue(1)
-            k_step.setRange(1, 10)
-            k_step.setTooltip('Keyframe interval for baking (1 = every frame, 2 = every 2nd frame, 5 = every 5th frame). Keeps spline curves sparse and easy to edit.')
-            node.addKnob(k_step)
-        if not node.knob('ar_resolution'):
-            k_res = nuke.Enumeration_Knob(
-                'ar_resolution', 'Tracking Res',
-                ['720p (Fast / AI Optimized)', '960p (Balanced)', 'Full (Original / Slow)']
-            )
-            k_res.setValue('720p (Fast / AI Optimized)')
-            k_res.setTooltip('Downscale resolution for AI tracking. Automatically unscaled back with floating-point subpixel accuracy.')
-            node.addKnob(k_res)
-        if not node.knob('ar_toggle_tabs'):
-            btn_toggle_tabs = nuke.PyScript_Knob(
-                'ar_toggle_tabs', 'Toggle Extra Tabs',
-                'import nuke_bridge; nuke_bridge.toggle_native_roto_tabs(nuke.thisNode())'
-            )
-            btn_toggle_tabs.setTooltip('Toggle extra native tabs (Transform, Motion Blur, Shape, Clone, Lifetime, Tracking) visibility.')
-            node.addKnob(btn_toggle_tabs)
-        if not node.knob('ar_multiref_list'):
-            node.addKnob(nuke.Text_Knob('ar_div_multiref', '<font size=3 color="#00e5ff"><b>Multi-Reference Tracking</b></font>'))
-            btn_detect_keys = nuke.PyScript_Knob(
-                'ar_detect_keys', 'Detect Shape Keys',
-                'import nuke_bridge; nuke_bridge.on_node_detect_keyframes(nuke.thisNode())'
-            )
-            btn_detect_keys.setTooltip('Automatically scans active Roto shape to detect all existing user-modified keyframe frames.')
-            btn_add_curr_ref = nuke.PyScript_Knob(
-                'ar_add_curr_ref', '+ Add Current',
-                'import nuke_bridge; nuke_bridge.on_node_add_current_ref(nuke.thisNode())'
-            )
-            btn_add_curr_ref.setTooltip('Adds the current playhead frame to the multi-reference keyframe list.')
-            btn_clear_multiref = nuke.PyScript_Knob(
-                'ar_clear_multiref', 'Clear',
-                'import nuke_bridge; nuke_bridge.on_node_clear_multiref(nuke.thisNode())'
-            )
-            btn_clear_multiref.setTooltip('Clears the multi-reference keyframe list.')
-            btn_track_multiref = nuke.PyScript_Knob(
-                'ar_track_multiref', '<b><font color="#00e5ff">⚡ Track Multi-Reference</font></b>',
-                'import nuke_bridge; nuke_bridge.on_node_track_multi_ref(nuke.thisNode())'
-            )
-            btn_track_multiref.setTooltip('Executes bidirectional AI tracking across all reference keyframes. 100% preserves your manual keyframes while filling in-between frames with seamless visibility-weighted tracking.')
-            btn_detect_keys.setFlag(nuke.STARTLINE)
-            btn_add_curr_ref.clearFlag(nuke.STARTLINE)
-            btn_clear_multiref.clearFlag(nuke.STARTLINE)
-            btn_track_multiref.clearFlag(nuke.STARTLINE)
-            node.addKnob(btn_detect_keys)
-            node.addKnob(btn_add_curr_ref)
-            node.addKnob(btn_clear_multiref)
-            node.addKnob(btn_track_multiref)
-            k_multiref_list = nuke.String_Knob('ar_multiref_list', 'Keyframes')
-            k_multiref_list.setValue('')
-            k_multiref_list.setTooltip('Comma-separated list of reference keyframe numbers (e.g. "1, 35, 70, 100"). Leave blank to auto-detect from the shape.')
-            node.addKnob(k_multiref_list)
+    # Detect if node needs upgrade (e.g. ar_ref_frame is Int_Knob or missing ar_add_curr / ar_clear_ref)
+    needs_rebuild = False
+    if node.knob('ar_ref_frame') and node.knob('ar_ref_frame').Class() != 'String_Knob':
+        needs_rebuild = True
+    elif not node.knob('ar_add_curr') or not node.knob('ar_clear_ref'):
+        needs_rebuild = True
+
+    saved_ref = ""
+    saved_start = None
+    saved_end = None
+    saved_step = None
+    saved_res = None
+    saved_tg = None
+
+    if (node.knob('AutoRoto') or node.knob('AutoRotoTrackerTab')) and needs_rebuild:
+        if node.knob('ar_ref_frame'):
+            try:
+                saved_ref = str(node['ar_ref_frame'].value()).strip()
+            except Exception:
+                pass
+        if node.knob('ar_start_frame'):
+            saved_start = int(node['ar_start_frame'].value())
+        if node.knob('ar_end_frame'):
+            saved_end = int(node['ar_end_frame'].value())
+        if node.knob('ar_key_step'):
+            saved_step = int(node['ar_key_step'].value())
+        if node.knob('ar_resolution'):
+            saved_res = node['ar_resolution'].value()
+        if node.knob('ar_keep_tangents'):
+            saved_tg = bool(node['ar_keep_tangents'].value())
+
+        # Remove all existing AutoRoto knobs to rebuild cleanly in order
+        all_ar = [k for k in node.knobs().keys() if k.startswith('ar_') or k in ('AutoRoto', 'AutoRotoTrackerTab')]
+        for k in all_ar:
+            try:
+                node.removeKnob(node.knob(k))
+            except Exception:
+                pass
+    elif (node.knob('AutoRoto') or node.knob('AutoRotoTrackerTab')) and not needs_rebuild:
         hide_intermediate_native_tabs(node)
         make_autoroto_first_tab(node.name())
         return
@@ -1124,7 +1108,7 @@ def setup_autoroto_knobs(node):
         'ar_to_start', '|◀',
         'import nuke_bridge; nuke_bridge.on_node_track_to_start(nuke.thisNode())'
     )
-    btn_to_start.setTooltip('Track backward from reference frame to start frame')
+    btn_to_start.setTooltip('Track backward from current frame to start frame')
 
     btn_step_bwd = nuke.PyScript_Knob(
         'ar_step_bwd', '◀',
@@ -1142,13 +1126,13 @@ def setup_autoroto_knobs(node):
         'ar_to_end', '▶|',
         'import nuke_bridge; nuke_bridge.on_node_track_to_end(nuke.thisNode())'
     )
-    btn_to_end.setTooltip('Track forward from reference frame to end frame')
+    btn_to_end.setTooltip('Track forward from current frame to end frame')
 
     btn_range = nuke.PyScript_Knob(
         'ar_track_range', '<b><font color="#4caf50">🚀 Track Full Range</font></b>',
         'import nuke_bridge; nuke_bridge.on_node_track_range(nuke.thisNode())'
     )
-    btn_range.setTooltip('Run CoTracker GPU on RTX 4080 across entire specified frame range')
+    btn_range.setTooltip('Run AI tracking across frame range. Single frame = standard track; Multiple frames = multi-reference bidirectional AI track with 100% keyframe preservation.')
 
     btn_to_start.setFlag(nuke.STARTLINE)
     btn_step_bwd.clearFlag(nuke.STARTLINE)
@@ -1162,30 +1146,42 @@ def setup_autoroto_knobs(node):
     node.addKnob(btn_to_end)
     node.addKnob(btn_range)
 
-    # 4. Divider & Frame Range + Key Step
+    # 4. Divider & Ref Frame + Frame Range + Key Step
     node.addKnob(nuke.Text_Knob('ar_div1', ''))
 
     curr_f = int(nuke.frame())
     start_f = int(nuke.root()['first_frame'].value())
     end_f = int(nuke.root()['last_frame'].value())
 
-    k_ref = nuke.Int_Knob('ar_ref_frame', 'Ref Frame')
-    k_ref.setValue(curr_f)
-    k_ref.setTooltip('Reference frame where your roto spline is hand-drawn and anchored.')
+    # Unified Ref Frame: supports single frame ('1') or multiple frames ('1, 45, 90')
+    k_ref = nuke.String_Knob('ar_ref_frame', 'Ref Frame')
+    initial_ref = saved_ref if saved_ref else str(curr_f)
+    k_ref.setValue(initial_ref)
+    k_ref.setTooltip('Reference frame(s) where your roto spline is hand-drawn and anchored. Enter a single frame (e.g. "1") or multiple frames (e.g. "1, 45, 90") for multi-reference bidirectional AI tracking. Leave blank to auto-detect from shape.')
     node.addKnob(k_ref)
 
-    k_set_curr = nuke.PyScript_Knob(
-        'ar_set_curr', 'Set Current',
-        'import nuke_bridge; nuke_bridge.on_node_set_current_frame(nuke.thisNode())'
+    btn_add_curr = nuke.PyScript_Knob(
+        'ar_add_curr', '+ Add Current',
+        'import nuke_bridge; nuke_bridge.on_node_add_current_ref(nuke.thisNode())'
     )
-    node.addKnob(k_set_curr)
+    btn_add_curr.setTooltip('Add current playhead frame to reference frames list')
+    btn_add_curr.clearFlag(nuke.STARTLINE)
+    node.addKnob(btn_add_curr)
+
+    btn_clear_ref = nuke.PyScript_Knob(
+        'ar_clear_ref', 'Clear',
+        'import nuke_bridge; nuke_bridge.on_node_clear_ref(nuke.thisNode())'
+    )
+    btn_clear_ref.setTooltip('Clear reference frame list (will auto-detect shape keys on track)')
+    btn_clear_ref.clearFlag(nuke.STARTLINE)
+    node.addKnob(btn_clear_ref)
 
     k_start = nuke.Int_Knob('ar_start_frame', 'Start Frame')
-    k_start.setValue(start_f)
+    k_start.setValue(saved_start if saved_start is not None else start_f)
     node.addKnob(k_start)
 
     k_end = nuke.Int_Knob('ar_end_frame', 'End Frame')
-    k_end.setValue(end_f)
+    k_end.setValue(saved_end if saved_end is not None else end_f)
     node.addKnob(k_end)
 
     k_sync_range = nuke.PyScript_Knob(
@@ -1195,7 +1191,7 @@ def setup_autoroto_knobs(node):
     node.addKnob(k_sync_range)
 
     k_step = nuke.Int_Knob('ar_key_step', 'Key Step')
-    k_step.setValue(1)
+    k_step.setValue(saved_step if saved_step is not None else 1)
     k_step.setRange(1, 10)
     k_step.setTooltip('Keyframe interval for baking (1 = every frame, 2 = every 2nd frame, 5 = every 5th frame). Keeps spline curves sparse and easy to edit.')
     node.addKnob(k_step)
@@ -1204,13 +1200,13 @@ def setup_autoroto_knobs(node):
         'ar_resolution', 'Tracking Res',
         ['720p (Fast / AI Optimized)', '960p (Balanced)', 'Full (Original / Slow)']
     )
-    k_res.setValue('720p (Fast / AI Optimized)')
+    k_res.setValue(saved_res if saved_res is not None else '720p (Fast / AI Optimized)')
     k_res.setTooltip('Downscale resolution for AI tracking. High resolution footage is automatically downscaled for 3-5x faster GPU inference, then unscaled back to original resolution with floating-point subpixel accuracy.')
     node.addKnob(k_res)
 
     # 5. Options
     k_tangents = nuke.Boolean_Knob('ar_keep_tangents', 'Preserve Curvature / Tangents')
-    k_tangents.setValue(True)
+    k_tangents.setValue(saved_tg if saved_tg is not None else True)
     k_tangents.setTooltip('When enabled, rotates and preserves Bezier tangent handles naturally with tracked surface without wild loop distortion.')
     node.addKnob(k_tangents)
 
@@ -1221,49 +1217,7 @@ def setup_autoroto_knobs(node):
     btn_fix_tangents.setTooltip('Cleans corrupted Bezier tangent handles and restores crisp curvature matching reference frame, instantly eliminating loops.')
     node.addKnob(btn_fix_tangents)
 
-    # 6. Multi-Reference Tracking Section
-    node.addKnob(nuke.Text_Knob('ar_div_multiref', '<font size=3 color="#00e5ff"><b>Multi-Reference Tracking</b></font>'))
-
-    btn_detect_keys = nuke.PyScript_Knob(
-        'ar_detect_keys', 'Detect Shape Keys',
-        'import nuke_bridge; nuke_bridge.on_node_detect_keyframes(nuke.thisNode())'
-    )
-    btn_detect_keys.setTooltip('Automatically scans active Roto shape to detect all existing user-modified keyframe frames.')
-
-    btn_add_curr_ref = nuke.PyScript_Knob(
-        'ar_add_curr_ref', '+ Add Current',
-        'import nuke_bridge; nuke_bridge.on_node_add_current_ref(nuke.thisNode())'
-    )
-    btn_add_curr_ref.setTooltip('Adds the current playhead frame to the multi-reference keyframe list.')
-
-    btn_clear_multiref = nuke.PyScript_Knob(
-        'ar_clear_multiref', 'Clear',
-        'import nuke_bridge; nuke_bridge.on_node_clear_multiref(nuke.thisNode())'
-    )
-    btn_clear_multiref.setTooltip('Clears the multi-reference keyframe list.')
-
-    btn_track_multiref = nuke.PyScript_Knob(
-        'ar_track_multiref', '<b><font color="#00e5ff">⚡ Track Multi-Reference</font></b>',
-        'import nuke_bridge; nuke_bridge.on_node_track_multi_ref(nuke.thisNode())'
-    )
-    btn_track_multiref.setTooltip('Executes bidirectional AI tracking across all reference keyframes. 100% preserves your manual keyframes while filling in-between frames with seamless visibility-weighted tracking.')
-
-    btn_detect_keys.setFlag(nuke.STARTLINE)
-    btn_add_curr_ref.clearFlag(nuke.STARTLINE)
-    btn_clear_multiref.clearFlag(nuke.STARTLINE)
-    btn_track_multiref.clearFlag(nuke.STARTLINE)
-
-    node.addKnob(btn_detect_keys)
-    node.addKnob(btn_add_curr_ref)
-    node.addKnob(btn_clear_multiref)
-    node.addKnob(btn_track_multiref)
-
-    k_multiref_list = nuke.String_Knob('ar_multiref_list', 'Keyframes')
-    k_multiref_list.setValue('')
-    k_multiref_list.setTooltip('Comma-separated list of reference keyframe numbers (e.g. "1, 35, 70, 100"). Leave blank to auto-detect from the shape.')
-    node.addKnob(k_multiref_list)
-
-    # 7. Utilities & Status
+    # 6. Utilities & Status
     node.addKnob(nuke.Text_Knob('ar_div2', ''))
 
     k_check_gpu = nuke.PyScript_Knob(
@@ -1280,7 +1234,7 @@ def setup_autoroto_knobs(node):
     node.addKnob(btn_toggle_tabs)
 
     k_status = nuke.String_Knob('ar_status', 'Status')
-    k_status.setValue('Ready. Draw a shape on Ref Frame and click Track.')
+    k_status.setValue('Ready. Set Ref Frame(s) and click Track.')
     node.addKnob(k_status)
 
     # Hide intermediate native tabs so AutoRoto and Roto sit side-by-side
@@ -1353,7 +1307,7 @@ def add_autoroto_to_selected():
 def on_node_set_current_frame(roto_node):
     curr = int(nuke.frame())
     if roto_node.knob('ar_ref_frame'):
-        roto_node.knob('ar_ref_frame').setValue(curr)
+        roto_node.knob('ar_ref_frame').setValue(str(curr))
     if roto_node.knob('ar_status'):
         roto_node.knob('ar_status').setValue(f"Reference frame set to {curr}.")
 
@@ -1379,7 +1333,9 @@ def on_node_fix_tangents(roto_node):
         nuke.message(f"No shape found in '{roto_node.name()}'.")
         return
 
-    ref_f = int(roto_node['ar_ref_frame'].value()) if roto_node.knob('ar_ref_frame') else int(nuke.frame())
+    raw_ref = roto_node['ar_ref_frame'].value() if roto_node.knob('ar_ref_frame') else ""
+    parsed_refs = parse_keyframe_list_string(str(raw_ref))
+    ref_f = parsed_refs[0] if parsed_refs else int(nuke.frame())
     bridge = NukeRotoBridge()
     pts_info = bridge.extract_shape_points(shape, ref_f)
     if not pts_info:
@@ -1539,26 +1495,45 @@ def _run_tracking_for_range(roto_node, start_f: int, end_f: int, ref_f: int):
 
 
 def on_node_track_range(roto_node):
-    curr_f = int(nuke.frame())
-    if roto_node.knob('ar_ref_frame'):
-        roto_node['ar_ref_frame'].setValue(curr_f)
+    """
+    Unified Tracking Engine:
+      - 1 Ref Frame: Standard single-frame tracking from anchor frame.
+      - 2+ Ref Frames: Multi-reference bidirectional AI tracking with 100% keyframe preservation.
+      - Blank Ref Frame: Auto-detects keyframes from active shape curves (or defaults to current frame).
+    """
+    raw_val = roto_node['ar_ref_frame'].value() if roto_node.knob('ar_ref_frame') else ""
+    ref_frames = parse_keyframe_list_string(str(raw_val))
 
-    start_f = int(roto_node['ar_start_frame'].value())
-    end_f = int(roto_node['ar_end_frame'].value())
+    start_f = int(roto_node['ar_start_frame'].value()) if roto_node.knob('ar_start_frame') else int(nuke.root()['first_frame'].value())
+    end_f = int(roto_node['ar_end_frame'].value()) if roto_node.knob('ar_end_frame') else int(nuke.root()['last_frame'].value())
     if start_f >= end_f:
         nuke.message("Start frame must be less than End frame.")
         return
 
-    # Anchor tracking at current frame; clamp if current frame is outside the range
-    ref_f = max(start_f, min(end_f, curr_f))
-    _run_tracking_for_range(roto_node, start_f, end_f, ref_f)
+    # If empty, auto-detect keyframes from the shape curves
+    if not ref_frames:
+        shape = get_target_shape(roto_node)
+        if shape:
+            ref_frames = detect_shape_keyframes(shape)
+            if ref_frames and roto_node.knob('ar_ref_frame'):
+                roto_node['ar_ref_frame'].setValue(", ".join(str(f) for f in ref_frames))
+
+    # If still empty (static shape with no keyframes), default to current playhead frame
+    if not ref_frames:
+        curr_f = int(nuke.frame())
+        ref_frames = [curr_f]
+        if roto_node.knob('ar_ref_frame'):
+            roto_node['ar_ref_frame'].setValue(str(curr_f))
+
+    # Unified automatic execution
+    if len(ref_frames) >= 2:
+        _run_multi_reference_tracking(roto_node, ref_frames, start_f, end_f)
+    else:
+        _run_tracking_for_range(roto_node, start_f, end_f, ref_frames[0])
 
 
 def on_node_track_to_end(roto_node):
     curr_f = int(nuke.frame())
-    if roto_node.knob('ar_ref_frame'):
-        roto_node['ar_ref_frame'].setValue(curr_f)
-
     end_f = int(roto_node['ar_end_frame'].value())
     if curr_f >= end_f:
         nuke.message(f"Current frame ({curr_f}) is already at or beyond End frame ({end_f}).")
@@ -1569,9 +1544,6 @@ def on_node_track_to_end(roto_node):
 
 def on_node_track_to_start(roto_node):
     curr_f = int(nuke.frame())
-    if roto_node.knob('ar_ref_frame'):
-        roto_node['ar_ref_frame'].setValue(curr_f)
-
     start_f = int(roto_node['ar_start_frame'].value())
     if curr_f <= start_f:
         nuke.message(f"Current frame ({curr_f}) is already at or before Start frame ({start_f}).")
@@ -1586,9 +1558,6 @@ def on_node_track_step(roto_node, direction: int):
     step = direction * key_step
 
     curr_f = int(nuke.frame())
-    if roto_node.knob('ar_ref_frame'):
-        roto_node['ar_ref_frame'].setValue(curr_f)
-
     target = curr_f + step
     start_f = min(curr_f, target)
     end_f = max(curr_f, target)
@@ -1597,13 +1566,47 @@ def on_node_track_step(roto_node, direction: int):
 
 
 # =========================================================================
-# Multi-Reference Tracking Event Handlers & Core Runner
+# Reference Frames Management & Core Runner
 # =========================================================================
+
+def on_node_add_current_ref(roto_node):
+    """
+    Adds current playhead frame to the reference frame list.
+    """
+    curr = int(nuke.frame())
+    raw_val = roto_node['ar_ref_frame'].value() if roto_node.knob('ar_ref_frame') else ""
+    frames = parse_keyframe_list_string(str(raw_val))
+    if curr not in frames:
+        frames.append(curr)
+        frames.sort()
+    new_val = ", ".join(str(f) for f in frames)
+    if roto_node.knob('ar_ref_frame'):
+        roto_node['ar_ref_frame'].setValue(new_val)
+    msg = f"Reference frames: {new_val}"
+    if roto_node.knob('ar_status'):
+        roto_node['ar_status'].setValue(msg)
+
+
+def on_node_clear_ref(roto_node):
+    """
+    Clears the reference frame list (will auto-detect shape keys on track).
+    """
+    if roto_node.knob('ar_ref_frame'):
+        roto_node['ar_ref_frame'].setValue("")
+    msg = "Reference frames cleared (will auto-detect shape keys on track)."
+    if roto_node.knob('ar_status'):
+        roto_node['ar_status'].setValue(msg)
+
+
+def on_node_clear_multiref(roto_node):
+    """Backwards-compatibility alias for on_node_clear_ref"""
+    on_node_clear_ref(roto_node)
+
 
 def on_node_detect_keyframes(roto_node):
     """
     Detects all keyframes created by the user on the active Roto shape
-    and populates the 'Keyframes' field.
+    and populates the 'Ref Frame' field.
     """
     shape = get_target_shape(roto_node)
     if not shape:
@@ -1614,49 +1617,25 @@ def on_node_detect_keyframes(roto_node):
     if not detected:
         curr = int(nuke.frame())
         msg = f"No keyframes detected on shape '{shape.name}'. Defaulted to current frame {curr}."
-        if roto_node.knob('ar_multiref_list'):
-            roto_node['ar_multiref_list'].setValue(str(curr))
+        if roto_node.knob('ar_ref_frame'):
+            roto_node['ar_ref_frame'].setValue(str(curr))
         if roto_node.knob('ar_status'):
             roto_node['ar_status'].setValue(msg)
         nuke.message(f"AutoRoto: {msg}")
         return
 
     frames_str = ", ".join(str(k) for k in detected)
-    if roto_node.knob('ar_multiref_list'):
-        roto_node['ar_multiref_list'].setValue(frames_str)
+    if roto_node.knob('ar_ref_frame'):
+        roto_node['ar_ref_frame'].setValue(frames_str)
     msg = f"Detected {len(detected)} shape keyframes: {frames_str}"
     if roto_node.knob('ar_status'):
         roto_node['ar_status'].setValue(msg)
     nuke.message(f"AutoRoto: {msg}")
 
 
-def on_node_add_current_ref(roto_node):
-    """
-    Adds current playhead frame to the multi-reference keyframe list.
-    """
-    curr = int(nuke.frame())
-    existing_text = roto_node['ar_multiref_list'].value() if roto_node.knob('ar_multiref_list') else ""
-    frames = parse_keyframe_list_string(existing_text)
-    if curr not in frames:
-        frames.append(curr)
-        frames.sort()
-    frames_str = ", ".join(str(k) for k in frames)
-    if roto_node.knob('ar_multiref_list'):
-        roto_node['ar_multiref_list'].setValue(frames_str)
-    msg = f"Added frame {curr} to multi-reference list: {frames_str}"
-    if roto_node.knob('ar_status'):
-        roto_node['ar_status'].setValue(msg)
-
-
-def on_node_clear_multiref(roto_node):
-    """
-    Clears the multi-reference keyframe list.
-    """
-    if roto_node.knob('ar_multiref_list'):
-        roto_node['ar_multiref_list'].setValue("")
-    msg = "Cleared multi-reference keyframe list."
-    if roto_node.knob('ar_status'):
-        roto_node['ar_status'].setValue(msg)
+def on_node_track_multi_ref(roto_node):
+    """Backwards-compatibility alias for on_node_track_range"""
+    on_node_track_range(roto_node)
 
 
 def _run_multi_reference_tracking(roto_node, ref_frames: List[int], start_f: int, end_f: int):
