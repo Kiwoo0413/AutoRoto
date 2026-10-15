@@ -1108,7 +1108,7 @@ def setup_autoroto_knobs(node):
     title = nuke.Text_Knob(
         'ar_title', '',
         '<font size=4 color="#e58934"><b>AutoRoto</b></font> '
-        '<font color="#888">CoTracker3 GPU (RTX 4080)</font>'
+        '<font color="#888">CoTracker3 GPU</font>'
     )
     node.addKnob(title)
 
@@ -1432,7 +1432,7 @@ def _run_tracking_for_range(roto_node, start_f: int, end_f: int, ref_f: int):
         max_size = 0  # Full native resolution
 
     total_frames = end_f - start_f + 1
-    progress = nuke.ProgressTask(f"AutoRoto: Tracking {len(pts_info)} points on RTX 4080...")
+    progress = nuke.ProgressTask(f"AutoRoto: Tracking {len(pts_info)} points...")
     progress.setProgress(5)
     progress.setMessage(f"Exporting {total_frames} frames from Nuke...")
 
