@@ -61,5 +61,5 @@ top_menu.addCommand(
 top_menu.addSeparator()
 top_menu.addCommand(
     'About AutoRoto',
-    """import nuke; nuke.message("AutoRoto v2.1 (Tracker Buttons on Roto)\\n\\nNative Nuke Roto Node equipped with Tracker-style VCR buttons & CoTracker3 GPU backend.\\n\\n• Draw shapes natively in Nuke Viewer\\n• VCR Tracker buttons: |◀, ◀, ▶, ▶|, Track Range\\n• Zero-drift bidirectional tracking on RTX 4080")"""
+    """import nuke; nuke.message("AutoRoto v2.1 (Tracker Buttons on Roto)\\n\\nNative Nuke Roto Node equipped with Tracker-style VCR buttons & CoTracker3 GPU backend.\\n\\n• Draw shapes natively in Nuke Viewer\\n• VCR Tracker buttons: |◀, ◀, ▶, ▶|, Track Range\\n• Zero-drift bidirectional tracking")"""
 )
