@@ -1029,6 +1029,11 @@ def setup_autoroto_knobs(node):
     Equips a native Roto node with Tracker-style VCR buttons & CoTracker controls.
     Arranges AutoRoto as the first tab (Tab 1).
     """
+    # Preserve legacy reference lists before removing deprecated knobs.
+    legacy_refs = []
+    if node.knob('ar_multiref_list'):
+        legacy_refs = parse_keyframe_list_string(node['ar_multiref_list'].value())
+
     # 0. Clean up obsolete duplicated / deprecated knobs if present
     deprecated_knobs = [
         'ar_div_roto', 'ar_output', 'ar_premultiply', 'ar_cliptype',
@@ -1049,7 +1054,7 @@ def setup_autoroto_knobs(node):
         node.knob('AutoRotoTrackerTab').setLabel('AutoRoto')
 
     # Detect if node needs upgrade (e.g. ar_ref_frame is Int_Knob or missing ar_add_curr / ar_clear_ref)
-    needs_rebuild = False
+    needs_rebuild = bool(legacy_refs)
     if node.knob('ar_ref_frame') and node.knob('ar_ref_frame').Class() != 'String_Knob':
         needs_rebuild = True
     elif not node.knob('ar_add_curr') or not node.knob('ar_clear_ref'):
@@ -1065,9 +1070,13 @@ def setup_autoroto_knobs(node):
     if (node.knob('AutoRoto') or node.knob('AutoRotoTrackerTab')) and needs_rebuild:
         if node.knob('ar_ref_frame'):
             try:
-                saved_ref = str(node['ar_ref_frame'].value()).strip()
+                old_ref = node['ar_ref_frame']
+                saved_ref = (str(int(old_ref.value())) if old_ref.Class() == 'Int_Knob'
+                             else str(old_ref.value()).strip())
             except Exception:
                 pass
+        if legacy_refs:
+            saved_ref = ', '.join(str(f) for f in legacy_refs)
         if node.knob('ar_start_frame'):
             saved_start = int(node['ar_start_frame'].value())
         if node.knob('ar_end_frame'):
@@ -1379,6 +1388,10 @@ def on_node_fix_tangents(roto_node):
 
 
 def _run_tracking_for_range(roto_node, start_f: int, end_f: int, ref_f: int):
+    if not start_f <= ref_f <= end_f:
+        nuke.message(f"Reference frame ({ref_f}) must be within tracking range ({start_f}-{end_f}).")
+        return
+
     source_node = roto_node.input(0)
     if not source_node:
         nuke.message(f"Please connect video/footage to input of '{roto_node.name()}'.")
@@ -1870,39 +1883,6 @@ def _run_multi_reference_tracking(roto_node, ref_frames: List[int], start_f: int
         del progress
         if temp_dir and os.path.exists(temp_dir):
             shutil.rmtree(temp_dir, ignore_errors=True)
-
-
-def on_node_track_multi_ref(roto_node):
-    """
-    Callback when user clicks '⚡ Track Multi-Reference'.
-    Reads keyframe list (or auto-detects from shape), validates, and executes multi-reference tracking.
-    """
-    raw_text = roto_node['ar_multiref_list'].value() if roto_node.knob('ar_multiref_list') else ""
-    ref_frames = parse_keyframe_list_string(raw_text)
-
-    shape = get_target_shape(roto_node)
-    if not shape:
-        nuke.message(f"No shape found in '{roto_node.name()}'. Please draw or select a roto shape first.")
-        return
-
-    # If list is empty, auto-detect from shape curves
-    if not ref_frames:
-        ref_frames = detect_shape_keyframes(shape)
-        if ref_frames:
-            frames_str = ", ".join(str(k) for k in ref_frames)
-            if roto_node.knob('ar_multiref_list'):
-                roto_node['ar_multiref_list'].setValue(frames_str)
-
-    if not ref_frames:
-        curr = int(nuke.frame())
-        ref_frames = [curr]
-        if roto_node.knob('ar_multiref_list'):
-            roto_node['ar_multiref_list'].setValue(str(curr))
-
-    start_f = int(roto_node['ar_start_frame'].value()) if roto_node.knob('ar_start_frame') else int(nuke.root()['first_frame'].value())
-    end_f = int(roto_node['ar_end_frame'].value()) if roto_node.knob('ar_end_frame') else int(nuke.root()['last_frame'].value())
-
-    _run_multi_reference_tracking(roto_node, ref_frames, start_f, end_f)
 
 
 # Automatically apply tab move & VCR button sizing if Nuke GUI session is active
