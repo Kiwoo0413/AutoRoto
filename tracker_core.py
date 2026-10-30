@@ -12,44 +12,100 @@ import subprocess
 import tempfile
 from typing import List, Dict, Any, Tuple, Optional
 
+def _get_clean_subprocess_env() -> Dict[str, str]:
+    """
+    Returns a clean copy of os.environ with Nuke's internal Python variables
+    (PYTHONHOME, PYTHONPATH) stripped so external Python interpreters can
+    load their own site-packages (e.g. PyTorch / CUDA) without conflict.
+    """
+    env = os.environ.copy()
+    env.pop("PYTHONHOME", None)
+    env.pop("PYTHONPATH", None)
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
+    return env
+
+
+def _is_nuke_executable(exe_path: str) -> bool:
+    """Checks whether an executable path points to Nuke's bundled Python or binary."""
+    if not exe_path:
+        return False
+    norm = exe_path.replace("\\", "/").lower()
+    base = os.path.basename(norm)
+    return "nuke" in base or "/nuke" in norm
+
+
 def get_candidate_pythons(custom_path: Optional[str] = None) -> List[str]:
     candidates = []
-    if custom_path and os.path.exists(custom_path.strip()):
-        candidates.append(custom_path.strip())
 
-    # 1. Dedicated Environment Variable
-    env_py = os.environ.get("AUTOROTO_PYTHON")
-    if env_py and os.path.isfile(env_py):
-        candidates.append(env_py)
+    def _add(p: Optional[str]):
+        if not p:
+            return
+        p_str = os.path.normpath(p.strip())
+        if _is_nuke_executable(p_str):
+            return
+        if os.path.isfile(p_str) and p_str not in candidates:
+            candidates.append(p_str)
 
-    # 2. Dynamic User Directories (Windows, Conda, Python.org)
+    if custom_path:
+        _add(custom_path)
+
+    # 1. Dedicated Environment Variables
+    for env_key in ("AUTOROTO_PYTHON", "ALPHAGEN_PYTHON"):
+        _add(os.environ.get(env_key))
+
+    # 2. Workspace / Module Relative Virtual Environments (via __file__ & sys.path)
+    base_dirs = [os.path.dirname(os.path.abspath(__file__))]
+    for sp in sys.path:
+        if sp and os.path.isdir(sp):
+            abs_sp = os.path.abspath(sp)
+            if not _is_nuke_executable(abs_sp) and abs_sp not in base_dirs:
+                base_dirs.append(abs_sp)
+
+    venv_rel_paths = (
+        os.path.join(".venv", "Scripts", "python.exe"),
+        os.path.join("venv", "Scripts", "python.exe"),
+        os.path.join(".venv", "bin", "python"),
+        os.path.join("venv", "bin", "python"),
+        os.path.join("..", ".venv", "Scripts", "python.exe"),
+        os.path.join("..", "venv", "Scripts", "python.exe"),
+    )
+    for bdir in base_dirs:
+        for vrel in venv_rel_paths:
+            _add(os.path.join(bdir, vrel))
+
+    # 3. Current sys.executable & relative parent directories
+    if sys.executable and not _is_nuke_executable(sys.executable):
+        _add(sys.executable)
+
+    # 4. Dynamic User Home Relative Directories (Windows, Conda, Python.org)
     user_home = os.path.expanduser("~")
     common_relative = [
-        r"AppData\Local\Programs\Python\Python312\python.exe",
-        r"AppData\Local\Programs\Python\Python311\python.exe",
-        r"AppData\Local\Programs\Python\Python310\python.exe",
-        r"miniconda3\python.exe",
-        r"anaconda3\python.exe",
-        r"miniconda3\envs\autoroto\python.exe",
-        r"anaconda3\envs\autoroto\python.exe",
-        "miniconda3/bin/python",
-        "anaconda3/bin/python",
+        os.path.join("AppData", "Local", "Programs", "Python", "Python312", "python.exe"),
+        os.path.join("AppData", "Local", "Programs", "Python", "Python311", "python.exe"),
+        os.path.join("AppData", "Local", "Programs", "Python", "Python310", "python.exe"),
+        os.path.join("miniconda3", "envs", "autoroto", "python.exe"),
+        os.path.join("anaconda3", "envs", "autoroto", "python.exe"),
+        os.path.join("miniconda3", "python.exe"),
+        os.path.join("anaconda3", "python.exe"),
+        os.path.join("miniconda3", "bin", "python"),
+        os.path.join("anaconda3", "bin", "python"),
     ]
     for rel in common_relative:
-        p = os.path.join(user_home, rel)
-        if os.path.isfile(p) and p not in candidates:
-            candidates.append(p)
+        _add(os.path.join(user_home, rel))
 
-    # 3. System PATH Discovery
+    # 5. System PATH Discovery (filtering out Nuke's directory & WindowsApps stub)
+    path_env = os.environ.get("PATH", "")
+    for path_dir in path_env.split(os.pathsep):
+        path_dir = path_dir.strip()
+        if not path_dir or _is_nuke_executable(path_dir) or "windowsapps" in path_dir.lower():
+            continue
+        for exe_name in ("python.exe", "python3.exe", "python", "python3"):
+            _add(os.path.join(path_dir, exe_name))
+
     for cmd in ("python", "python3"):
         which_p = shutil.which(cmd)
-        if which_p and which_p not in candidates:
-            candidates.append(which_p)
-        if cmd not in candidates:
-            candidates.append(cmd)
-
-    if sys.executable not in candidates:
-        candidates.append(sys.executable)
+        if which_p and "windowsapps" not in which_p.lower():
+            _add(which_p)
 
     return candidates
 
@@ -61,13 +117,21 @@ def find_ai_python(custom_path: Optional[str] = None) -> Optional[str]:
     """
     candidates = get_candidate_pythons(custom_path)
     cpu_fallback = None
+    clean_env = _get_clean_subprocess_env()
+    creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
 
     for py_exe in candidates:
         if not os.path.isfile(py_exe) and not any(py_exe.startswith(prefix) for prefix in ("python", "python3")):
             continue
         try:
             cmd = [py_exe, "-c", "import torch; print('CUDA' if torch.cuda.is_available() else 'CPU')"]
-            out = subprocess.check_output(cmd, stderr=subprocess.STDOUT, timeout=6).decode().strip()
+            out = subprocess.check_output(
+                cmd,
+                stderr=subprocess.STDOUT,
+                timeout=8,
+                env=clean_env,
+                creationflags=creationflags
+            ).decode(errors="replace").strip()
             if "CUDA" in out:
                 return py_exe
             elif "CPU" in out and cpu_fallback is None:
@@ -94,13 +158,20 @@ def check_ai_environment(custom_path: Optional[str] = None) -> Dict[str, Any]:
         }
 
     try:
+        clean_env = _get_clean_subprocess_env()
+        creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
         check_script = (
             "import torch, json\n"
             "has_cuda = torch.cuda.is_available()\n"
             "device_name = torch.cuda.get_device_name(0) if has_cuda else 'CPU'\n"
             "print(json.dumps({'cuda': has_cuda, 'device': device_name, 'torch': torch.__version__}))\n"
         )
-        out = subprocess.check_output([py_exe, "-c", check_script], timeout=8).decode().strip()
+        out = subprocess.check_output(
+            [py_exe, "-c", check_script],
+            timeout=10,
+            env=clean_env,
+            creationflags=creationflags
+        ).decode(errors="replace").strip()
         data = json.loads(out.splitlines()[-1])
         return {
             'available': True,
@@ -409,6 +480,8 @@ def run_cotracker_point_tracking(
         json.dump(config_data, f)
 
     cmd = [py_exe, "-u", worker_script, "--config", config_path]
+    clean_env = _get_clean_subprocess_env()
+    creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
 
     proc = subprocess.Popen(
         cmd,
@@ -416,7 +489,9 @@ def run_cotracker_point_tracking(
         stderr=subprocess.PIPE,
         text=True,
         bufsize=1,
-        encoding="utf-8"
+        encoding="utf-8",
+        env=clean_env,
+        creationflags=creationflags
     )
 
     try:

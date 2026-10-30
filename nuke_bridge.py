@@ -8,9 +8,14 @@ Provides:
 """
 
 import os
+import sys
 import shutil
 import tempfile
 from typing import List, Dict, Any, Tuple, Optional
+
+_curr_dir = os.path.dirname(os.path.abspath(__file__))
+if _curr_dir not in sys.path:
+    sys.path.insert(0, _curr_dir)
 
 try:
     from PySide6 import QtWidgets, QtCore
@@ -1231,7 +1236,7 @@ def setup_autoroto_knobs(node):
 
     k_check_gpu = nuke.PyScript_Knob(
         'ar_check_gpu', 'Check GPU Status',
-        'import tracker_core; info = tracker_core.check_ai_environment(); nuke.message(f"Device: {info.get(\'device_name\')}\\nCUDA: {info.get(\'cuda\')}\\nPyTorch: {info.get(\'torch_version\')}")'
+        'import nuke_bridge; nuke_bridge.on_node_check_gpu(nuke.thisNode())'
     )
     node.addKnob(k_check_gpu)
 
@@ -1330,6 +1335,23 @@ def on_node_sync_range(roto_node):
         roto_node.knob('ar_end_frame').setValue(end)
     if roto_node.knob('ar_status'):
         roto_node.knob('ar_status').setValue(f"Synced project range: {start} - {end}.")
+
+
+def on_node_check_gpu(roto_node=None):
+    """
+    Checks external AI Python / PyTorch / CUDA status and updates node status + popup dialog.
+    """
+    info = tracker_core.check_ai_environment()
+    if roto_node and roto_node.knob('ar_status'):
+        roto_node.knob('ar_status').setValue(info.get('message', ''))
+    nuke.message(
+        f"CoTracker AI Status:\n\n"
+        f"• Device: {info.get('device_name')}\n"
+        f"• CUDA: {info.get('cuda')}\n"
+        f"• PyTorch: {info.get('torch_version')}\n"
+        f"• Python: {info.get('python_path')}\n"
+        f"• Status: {info.get('message')}"
+    )
 
 
 def on_node_fix_tangents(roto_node):

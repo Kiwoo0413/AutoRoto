@@ -56,7 +56,7 @@ top_menu.addCommand(
 top_menu.addSeparator()
 top_menu.addCommand(
     'Check CoTracker GPU Status',
-    """import tracker_core; info = tracker_core.check_ai_environment(); nuke.message(f"CoTracker AI Status:\\n\\n• Device: {info.get('device_name')}\\n• CUDA: {info.get('cuda')}\\n• PyTorch: {info.get('torch_version')}\\n• Status: {info.get('message')}")"""
+    'import nuke_bridge; nuke_bridge.on_node_check_gpu()'
 )
 top_menu.addSeparator()
 top_menu.addCommand(
