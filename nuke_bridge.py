@@ -886,25 +886,137 @@ class NukeRotoBridge:
 # Tracker-Style Knobs Setup for Native Roto Nodes
 # =========================================================================
 
-def get_target_shape(roto_node):
+def _is_roto_shape(elem) -> bool:
+    """True if elem is a trackable Roto shape (not a Layer)."""
+    if isinstance(elem, rp.Layer):
+        return False
+    return isinstance(elem, rp.Shape) or hasattr(elem, 'getControlPoint') or type(elem).__name__ == 'Shape'
+
+
+def get_all_shapes(roto_node) -> list:
     """
-    Finds the active or first shape within the Roto node.
+    Returns every shape inside the Roto node in curve-list order (recursing into Layers).
     """
     curves = roto_node['curves']
     root = getattr(curves, 'rootLayer', getattr(curves, 'root', None))
     if not root:
-        return None
+        return []
 
     shapes = []
     def _walk(item):
         for elem in item:
-            if isinstance(elem, rp.Shape) or hasattr(elem, 'getControlPoint') or type(elem).__name__ == 'Shape':
-                shapes.append(elem)
-            elif isinstance(elem, rp.Layer):
+            if isinstance(elem, rp.Layer):
                 _walk(elem)
+            elif _is_roto_shape(elem):
+                shapes.append(elem)
 
     _walk(root)
+    return shapes
+
+
+def get_selected_shapes(roto_node) -> list:
+    """
+    Returns shapes currently selected in the Roto curve list / Viewer (curves.getSelected()).
+    Selected Layers are expanded into all of their child shapes. Duplicates are removed.
+    """
+    try:
+        selected = roto_node['curves'].getSelected()
+    except Exception:
+        return []
+
+    result = []
+    seen = set()
+
+    def _add(elem):
+        if isinstance(elem, rp.Layer):
+            for child in elem:
+                _add(child)
+        elif _is_roto_shape(elem):
+            key = getattr(elem, 'name', None) or id(elem)
+            if key not in seen:
+                seen.add(key)
+                result.append(elem)
+
+    for elem in (selected or []):
+        _add(elem)
+    return result
+
+
+def get_target_shapes(roto_node) -> list:
+    """
+    Resolves which shapes AutoRoto operates on:
+      1. Shapes selected in the Roto curve list / Viewer (each one tracked independently).
+      2. Fallback when nothing is selected: the top shape in the curve list.
+    """
+    selected = get_selected_shapes(roto_node)
+    if selected:
+        return selected
+    return get_all_shapes(roto_node)[:1]
+
+
+def get_target_shape(roto_node):
+    """
+    Backwards-compatible single-shape accessor: first entry of get_target_shapes().
+    """
+    shapes = get_target_shapes(roto_node)
     return shapes[0] if shapes else None
+
+
+def _shape_names(shapes) -> str:
+    return ", ".join(str(getattr(s, 'name', '?')) for s in shapes)
+
+
+def _build_combined_queries(bridge, roto_node, shapes, frame: int, t_rel: float):
+    """
+    Builds ONE CoTracker query list covering all points of all shapes at `frame`.
+    Every point gets a unique global index so a single GPU pass tracks every shape.
+    Returns (queries, index_map) with index_map[global_idx] = (shape_idx, local_point_idx).
+    Point ordering is deterministic, so the same index_map is valid at any frame.
+    """
+    queries = []
+    index_map = {}
+    g_idx = 0
+    for s_i, shape in enumerate(shapes):
+        pts = bridge.extract_shape_points(shape, frame, roto_node=roto_node)
+        for p in pts:
+            queries.append({"index": g_idx, "t": float(t_rel), "x": float(p["x"]), "y": float(p["y"])})
+            index_map[g_idx] = (s_i, p["index"])
+            g_idx += 1
+    return queries, index_map
+
+
+def _split_tracks_by_shape(tracks, index_map, num_shapes: int) -> list:
+    """
+    Splits combined global-index tracks back into per-shape
+    {local_point_idx: {frame: (x, y, vis)}} dictionaries.
+    """
+    per_shape = [dict() for _ in range(num_shapes)]
+    for g_idx, f_map in tracks.items():
+        if g_idx in index_map:
+            s_i, local_idx = index_map[g_idx]
+            per_shape[s_i][local_idx] = f_map
+    return per_shape
+
+
+def _group_shapes_by_ref_frames(shapes, default_frame: int, detector=None) -> list:
+    """
+    Auto-detects keyframes per shape and groups shapes sharing identical reference frames,
+    so each group is tracked in one GPU pass while every shape keeps its own anchors.
+    Shapes without keyframes fall back to [default_frame].
+    Returns [(ref_frames_list, [shapes]), ...] in first-seen order.
+    """
+    if detector is None:
+        detector = detect_shape_keyframes
+    groups = {}
+    order = []
+    for shape in shapes:
+        frames = detector(shape) or [int(default_frame)]
+        key = tuple(frames)
+        if key not in groups:
+            groups[key] = []
+            order.append(key)
+        groups[key].append(shape)
+    return [(list(k), groups[k]) for k in order]
 
 
 def hide_intermediate_native_tabs(node):
@@ -1358,9 +1470,10 @@ def on_node_fix_tangents(roto_node):
     """
     Cleans up any corrupted or looping tangents by setting them to the reference frame's
     tangent offsets (or zero if sharp corners), removing all wild Bezier loop petals.
+    Applies to every selected shape (or the top shape when nothing is selected).
     """
-    shape = get_target_shape(roto_node)
-    if not shape:
+    shapes = get_target_shapes(roto_node)
+    if not shapes:
         nuke.message(f"No shape found in '{roto_node.name()}'.")
         return
 
@@ -1368,56 +1481,64 @@ def on_node_fix_tangents(roto_node):
     parsed_refs = parse_keyframe_list_string(str(raw_ref))
     ref_f = parsed_refs[0] if parsed_refs else int(nuke.frame())
     bridge = NukeRotoBridge()
-    pts_info = bridge.extract_shape_points(shape, ref_f)
-    if not pts_info:
-        nuke.message("No points found in shape.")
-        return
 
     curves = roto_node['curves']
     fixed_count = 0
 
-    for pt_data in pts_info:
-        raw_pt = pt_data['raw_point']
-        lt_dx, lt_dy = pt_data['lt_rel']
-        rt_dx, rt_dy = pt_data['rt_rel']
-        fc_dx, fc_dy = pt_data['fc_rel']
+    for shape in shapes:
+        pts_info = bridge.extract_shape_points(shape, ref_f)
+        for pt_data in pts_info:
+            raw_pt = pt_data['raw_point']
+            lt_dx, lt_dy = pt_data['lt_rel']
+            rt_dx, rt_dy = pt_data['rt_rel']
+            fc_dx, fc_dy = pt_data['fc_rel']
 
-        is_lt_zero = (abs(lt_dx) < 1e-3 and abs(lt_dy) < 1e-3)
-        is_rt_zero = (abs(rt_dx) < 1e-3 and abs(rt_dy) < 1e-3)
-        is_fc_zero = (abs(fc_dx) < 1e-3 and abs(fc_dy) < 1e-3)
+            is_lt_zero = (abs(lt_dx) < 1e-3 and abs(lt_dy) < 1e-3)
+            is_rt_zero = (abs(rt_dx) < 1e-3 and abs(rt_dy) < 1e-3)
+            is_fc_zero = (abs(fc_dx) < 1e-3 and abs(fc_dy) < 1e-3)
 
-        targets = [
-            (raw_pt.leftTangent, 0.0 if is_lt_zero else lt_dx, 0.0 if is_lt_zero else lt_dy),
-            (raw_pt.rightTangent, 0.0 if is_rt_zero else rt_dx, 0.0 if is_rt_zero else rt_dy),
-            (raw_pt.featherCenter, 0.0 if is_fc_zero else fc_dx, 0.0 if is_fc_zero else fc_dy),
-        ]
+            targets = [
+                (raw_pt.leftTangent, 0.0 if is_lt_zero else lt_dx, 0.0 if is_lt_zero else lt_dy),
+                (raw_pt.rightTangent, 0.0 if is_rt_zero else rt_dx, 0.0 if is_rt_zero else rt_dy),
+                (raw_pt.featherCenter, 0.0 if is_fc_zero else fc_dx, 0.0 if is_fc_zero else fc_dy),
+            ]
 
-        for comp, target_x, target_y in targets:
-            c_x = comp.getPositionAnimCurve(0)
-            c_y = comp.getPositionAnimCurve(1)
-            if c_x and c_y:
-                for k in list(c_x.keys()):
-                    c_x.addKey(k.x, float(target_x))
-                    c_y.addKey(k.x, float(target_y))
+            for comp, target_x, target_y in targets:
+                c_x = comp.getPositionAnimCurve(0)
+                c_y = comp.getPositionAnimCurve(1)
+                if c_x and c_y:
+                    for k in list(c_x.keys()):
+                        c_x.addKey(k.x, float(target_x))
+                        c_y.addKey(k.x, float(target_y))
 
-        fixed_count += 1
+            fixed_count += 1
+
+    if fixed_count == 0:
+        nuke.message("No points found in shape.")
+        return
 
     curves.changed()
-    msg = f"Cleaned tangents for {fixed_count} points! Wild loops removed."
+    msg = f"Cleaned tangents for {fixed_count} points in {len(shapes)} shape(s) [{_shape_names(shapes)}]! Wild loops removed."
     if roto_node.knob('ar_status'):
         roto_node.knob('ar_status').setValue(msg)
     nuke.message(f"AutoRoto: {msg}")
 
 
-def _run_tracking_for_range(roto_node, start_f: int, end_f: int, ref_f: int):
+def _run_tracking_for_range(roto_node, start_f: int, end_f: int, ref_f: int, shapes=None, notify: bool = True):
+    """
+    Single-reference tracking.
+    All target shapes (selected shapes, or top-shape fallback) are tracked together in ONE
+    CoTracker GPU pass, then each shape's points are baked back into its own curves independently.
+    Returns a summary string on success, otherwise None.
+    """
     if not start_f <= ref_f <= end_f:
         nuke.message(f"Reference frame ({ref_f}) must be within tracking range ({start_f}-{end_f}).")
-        return
+        return None
 
     source_node = roto_node.input(0)
     if not source_node:
         nuke.message(f"Please connect video/footage to input of '{roto_node.name()}'.")
-        return
+        return None
 
     # 1. Format Synchronization:
     # Ensure Roto node's canvas format matches the input footage format exactly.
@@ -1430,19 +1551,19 @@ def _run_tracking_for_range(roto_node, start_f: int, end_f: int, ref_f: int):
     except Exception:
         pass
 
-    shape = get_target_shape(roto_node)
-    if not shape:
+    if shapes is None:
+        shapes = get_target_shapes(roto_node)
+    if not shapes:
         nuke.message(f"No shape found in '{roto_node.name()}'. Please draw a roto shape at frame {ref_f}.")
-        return
+        return None
 
     bridge = NukeRotoBridge()
-    pts_info = bridge.extract_shape_points(shape, ref_f, roto_node=roto_node)
-    if not pts_info:
-        nuke.message(f"Shape '{shape.name}' has no control points at frame {ref_f}.")
-        return
-
     t_rel = float(ref_f - start_f)
-    queries = [{"index": p["index"], "t": t_rel, "x": float(p["x"]), "y": float(p["y"])} for p in pts_info]
+    queries, index_map = _build_combined_queries(bridge, roto_node, shapes, ref_f, t_rel)
+    if not queries:
+        nuke.message(f"Shape(s) [{_shape_names(shapes)}] have no control points at frame {ref_f}.")
+        return None
+    num_pts = len(queries)
 
     # Resolution downscaling configuration
     res_val = roto_node['ar_resolution'].value() if roto_node.knob('ar_resolution') else '720p'
@@ -1454,11 +1575,12 @@ def _run_tracking_for_range(roto_node, start_f: int, end_f: int, ref_f: int):
         max_size = 0  # Full native resolution
 
     total_frames = end_f - start_f + 1
-    progress = nuke.ProgressTask(f"AutoRoto: Tracking {len(pts_info)} points...")
+    progress = nuke.ProgressTask(f"AutoRoto: Tracking {num_pts} points in {len(shapes)} shape(s)...")
     progress.setProgress(5)
     progress.setMessage(f"Exporting {total_frames} frames from Nuke...")
 
     temp_dir = None
+    summary = None
     try:
         image_paths, temp_dir = bridge.export_source_frames(source_node, start_f, end_f)
         if progress.isCancelled():
@@ -1490,24 +1612,35 @@ def _run_tracking_for_range(roto_node, start_f: int, end_f: int, ref_f: int):
             raise RuntimeError("Tracking cancelled by user.")
 
         progress.setProgress(92)
-        progress.setMessage("Baking keyframes to Roto spline...")
+        progress.setMessage("Baking keyframes to Roto spline(s)...")
 
         keep_tg = bool(roto_node['ar_keep_tangents'].value()) if roto_node.knob('ar_keep_tangents') else True
         key_step = int(roto_node['ar_key_step'].value()) if roto_node.knob('ar_key_step') else 1
         key_step = max(1, key_step)
 
-        ok = bridge.bake_tracking_data_to_roto(
-            roto_node, shape, tracks, ref_f, keep_tangents=keep_tg, key_step=key_step
-        )
+        # Split combined tracks and bake each shape independently into its own curves
+        per_shape_tracks = _split_tracks_by_shape(tracks, index_map, len(shapes))
+        baked = []
+        for shape, shape_tracks in zip(shapes, per_shape_tracks):
+            if shape_tracks and bridge.bake_tracking_data_to_roto(
+                roto_node, shape, shape_tracks, ref_f, keep_tangents=keep_tg, key_step=key_step
+            ):
+                baked.append(shape)
 
         progress.setProgress(100)
-        if ok:
+        if baked:
             step_info = f" (Key Step: {key_step})" if key_step > 1 else ""
             res_info = f" [{max_size}p]" if max_size > 0 else " [Full Res]"
-            msg = f"✓ Tracked & Baked {len(pts_info)} points{step_info}{res_info} across frames {start_f}-{end_f}!"
+            summary = (f"✓ Tracked & Baked {num_pts} points in {len(baked)} shape(s) "
+                       f"[{_shape_names(baked)}]{step_info}{res_info} across frames {start_f}-{end_f}!")
             if roto_node.knob('ar_status'):
-                roto_node.knob('ar_status').setValue(msg)
-            nuke.message(f"AutoRoto: Complete!\n{len(pts_info)} points tracked and baked across {total_frames} frames{step_info}{res_info}.")
+                roto_node.knob('ar_status').setValue(summary)
+            if notify:
+                nuke.message(
+                    f"AutoRoto: Complete!\n"
+                    f"{len(baked)} shape(s) tracked independently: {_shape_names(baked)}\n"
+                    f"{num_pts} points baked across {total_frames} frames{step_info}{res_info}."
+                )
         else:
             if roto_node.knob('ar_status'):
                 roto_node.knob('ar_status').setValue("Bake failed.")
@@ -1528,13 +1661,16 @@ def _run_tracking_for_range(roto_node, start_f: int, end_f: int, ref_f: int):
         if temp_dir and os.path.exists(temp_dir):
             shutil.rmtree(temp_dir, ignore_errors=True)
 
+    return summary
+
 
 def on_node_track_range(roto_node):
     """
-    Unified Tracking Engine:
+    Unified Tracking Engine (targets selected shapes; each shape is tracked independently):
       - 1 Ref Frame: Standard single-frame tracking from anchor frame.
       - 2+ Ref Frames: Multi-reference bidirectional AI tracking with 100% keyframe preservation.
-      - Blank Ref Frame: Auto-detects keyframes from active shape curves (or defaults to current frame).
+      - Blank Ref Frame: Auto-detects keyframes PER SHAPE (each shape uses its own keys),
+        or defaults to the current playhead frame for static shapes.
     """
     raw_val = roto_node['ar_ref_frame'].value() if roto_node.knob('ar_ref_frame') else ""
     ref_frames = parse_keyframe_list_string(str(raw_val))
@@ -1545,26 +1681,44 @@ def on_node_track_range(roto_node):
         nuke.message("Start frame must be less than End frame.")
         return
 
-    # If empty, auto-detect keyframes from the shape curves
-    if not ref_frames:
-        shape = get_target_shape(roto_node)
-        if shape:
-            ref_frames = detect_shape_keyframes(shape)
-            if ref_frames and roto_node.knob('ar_ref_frame'):
-                roto_node['ar_ref_frame'].setValue(", ".join(str(f) for f in ref_frames))
+    # Explicit Ref Frame(s): shared by all target shapes
+    if ref_frames:
+        if len(ref_frames) >= 2:
+            _run_multi_reference_tracking(roto_node, ref_frames, start_f, end_f)
+        else:
+            _run_tracking_for_range(roto_node, start_f, end_f, ref_frames[0])
+        return
 
-    # If still empty (static shape with no keyframes), default to current playhead frame
-    if not ref_frames:
-        curr_f = int(nuke.frame())
-        ref_frames = [curr_f]
-        if roto_node.knob('ar_ref_frame'):
-            roto_node['ar_ref_frame'].setValue(str(curr_f))
+    # Blank Ref Frame: auto-detect keyframes per shape
+    shapes = get_target_shapes(roto_node)
+    if not shapes:
+        nuke.message(f"No shape found in '{roto_node.name()}'. Please draw a roto shape first.")
+        return
 
-    # Unified automatic execution
-    if len(ref_frames) >= 2:
-        _run_multi_reference_tracking(roto_node, ref_frames, start_f, end_f)
-    else:
-        _run_tracking_for_range(roto_node, start_f, end_f, ref_frames[0])
+    curr_f = int(nuke.frame())
+    groups = _group_shapes_by_ref_frames(shapes, curr_f)
+
+    # All shapes share the same keys: remember them in the Ref Frame field so
+    # re-runs stay anchored to the artist keys (not to previously baked keys).
+    if len(groups) == 1 and roto_node.knob('ar_ref_frame'):
+        roto_node['ar_ref_frame'].setValue(", ".join(str(f) for f in groups[0][0]))
+
+    notify_each = (len(groups) == 1)
+    summaries = []
+    for g_refs, g_shapes in groups:
+        if len(g_refs) >= 2:
+            res = _run_multi_reference_tracking(roto_node, g_refs, start_f, end_f, shapes=g_shapes, notify=notify_each)
+        else:
+            res = _run_tracking_for_range(roto_node, start_f, end_f, g_refs[0], shapes=g_shapes, notify=notify_each)
+        if not res:
+            break  # error / cancel already reported; stop remaining groups
+        summaries.append(f"• {_shape_names(g_shapes)}  (keys: {', '.join(str(f) for f in g_refs)})")
+
+    if not notify_each and summaries:
+        msg = f"✓ Tracked {len(summaries)} shape group(s), each with its own keyframes."
+        if roto_node.knob('ar_status'):
+            roto_node['ar_status'].setValue(msg)
+        nuke.message("AutoRoto: Complete!\nEach shape tracked independently with its own keyframes:\n\n" + "\n".join(summaries))
 
 
 def on_node_track_to_end(roto_node):
@@ -1640,18 +1794,18 @@ def on_node_clear_multiref(roto_node):
 
 def on_node_detect_keyframes(roto_node):
     """
-    Detects all keyframes created by the user on the active Roto shape
+    Detects all keyframes created by the user on the target (selected) Roto shape(s)
     and populates the 'Ref Frame' field.
     """
-    shape = get_target_shape(roto_node)
-    if not shape:
+    shapes = get_target_shapes(roto_node)
+    if not shapes:
         nuke.message(f"No shape found in '{roto_node.name()}'. Please draw or select a roto shape first.")
         return
 
-    detected = detect_shape_keyframes(shape)
+    detected = sorted(set(f for s in shapes for f in detect_shape_keyframes(s)))
     if not detected:
         curr = int(nuke.frame())
-        msg = f"No keyframes detected on shape '{shape.name}'. Defaulted to current frame {curr}."
+        msg = f"No keyframes detected on shape(s) [{_shape_names(shapes)}]. Defaulted to current frame {curr}."
         if roto_node.knob('ar_ref_frame'):
             roto_node['ar_ref_frame'].setValue(str(curr))
         if roto_node.knob('ar_status'):
@@ -1673,17 +1827,20 @@ def on_node_track_multi_ref(roto_node):
     on_node_track_range(roto_node)
 
 
-def _run_multi_reference_tracking(roto_node, ref_frames: List[int], start_f: int, end_f: int):
+def _run_multi_reference_tracking(roto_node, ref_frames: List[int], start_f: int, end_f: int, shapes=None, notify: bool = True):
     """
     Core execution engine for Multi-Reference Bidirectional AI Tracking.
     Runs forward and backward CoTracker3 GPU tracking between reference keyframes,
     blends trajectories with C1 smoothstep and visibility weights, and bakes into Roto
     while 100% preserving artist ground truth keyframes.
+    All target shapes share each GPU pass (combined queries), then are split and baked
+    back into their own curves independently.
+    Returns a summary string on success, otherwise None.
     """
     source_node = roto_node.input(0)
     if not source_node:
         nuke.message(f"Please connect video/footage to input of '{roto_node.name()}'.")
-        return
+        return None
 
     # 1. Format Synchronization
     try:
@@ -1694,27 +1851,28 @@ def _run_multi_reference_tracking(roto_node, ref_frames: List[int], start_f: int
     except Exception:
         pass
 
-    shape = get_target_shape(roto_node)
-    if not shape:
+    if shapes is None:
+        shapes = get_target_shapes(roto_node)
+    if not shapes:
         nuke.message(f"No shape found in '{roto_node.name()}'. Please draw or select a roto shape first.")
-        return
+        return None
 
     ref_frames = sorted(list(set(ref_frames)))
     if not ref_frames:
         nuke.message("No reference frames specified or detected.")
-        return
+        return None
 
     # If only 1 reference frame, delegate directly to standard tracking anchored at that frame
     if len(ref_frames) == 1:
-        _run_tracking_for_range(roto_node, start_f, end_f, ref_frames[0])
-        return
+        return _run_tracking_for_range(roto_node, start_f, end_f, ref_frames[0], shapes=shapes, notify=notify)
 
     bridge = NukeRotoBridge()
     first_ref = ref_frames[0]
-    pts_info = bridge.extract_shape_points(shape, first_ref, roto_node=roto_node)
-    if not pts_info:
-        nuke.message(f"Shape '{shape.name}' has no control points at frame {first_ref}.")
-        return
+    first_queries, index_map = _build_combined_queries(bridge, roto_node, shapes, first_ref, 0.0)
+    if not first_queries:
+        nuke.message(f"Shape(s) [{_shape_names(shapes)}] have no control points at frame {first_ref}.")
+        return None
+    num_pts = len(first_queries)
 
     # Determine global span across timeline and all reference keys
     min_needed = min(start_f, ref_frames[0])
@@ -1734,18 +1892,21 @@ def _run_multi_reference_tracking(roto_node, ref_frames: List[int], start_f: int
     num_intervals = len(ref_frames) - 1
     total_passes = (1 if min_needed < ref_frames[0] else 0) + (2 * num_intervals) + (1 if max_needed > ref_frames[-1] else 0)
 
-    progress = nuke.ProgressTask(f"AutoRoto: Multi-Reference Tracking ({len(ref_frames)} keys, {total_passes} passes)...")
+    progress = nuke.ProgressTask(
+        f"AutoRoto: Multi-Reference Tracking ({len(shapes)} shape(s), {len(ref_frames)} keys, {total_passes} passes)..."
+    )
     progress.setProgress(5)
     progress.setMessage(f"Exporting {total_frames} frames from Nuke...")
 
     temp_dir = None
+    summary = None
     try:
         image_paths, temp_dir = bridge.export_source_frames(source_node, min_needed, max_needed)
         if progress.isCancelled():
             raise RuntimeError("Tracking cancelled by user.")
 
         cache_base = get_nuke_cache_temp_dir()
-        master_tracks: Dict[int, Dict[int, Tuple[float, float, float]]] = {p['index']: {} for p in pts_info}
+        master_tracks: Dict[int, Dict[int, Tuple[float, float, float]]] = {g: {} for g in index_map}
         pass_counter = [0]
 
         def make_pass_callback(label):
@@ -1764,9 +1925,8 @@ def _run_multi_reference_tracking(roto_node, ref_frames: List[int], start_f: int
         if min_needed < ref_frames[0]:
             k1 = ref_frames[0]
             sub_paths = image_paths[0 : k1 - min_needed + 1]
-            pts_at_k1 = bridge.extract_shape_points(shape, k1, roto_node=roto_node)
             rel_t = float(k1 - min_needed)
-            queries = [{"index": p["index"], "t": rel_t, "x": float(p["x"]), "y": float(p["y"])} for p in pts_at_k1]
+            queries, _ = _build_combined_queries(bridge, roto_node, shapes, k1, rel_t)
             cb = make_pass_callback(f"Pre-range ({k1} ➔ {min_needed})")
             pass_counter[0] += 1
 
@@ -1794,11 +1954,9 @@ def _run_multi_reference_tracking(roto_node, ref_frames: List[int], start_f: int
                 continue
 
             sub_paths = image_paths[ka - min_needed : kb - min_needed + 1]
-            pts_ka = bridge.extract_shape_points(shape, ka, roto_node=roto_node)
-            pts_kb = bridge.extract_shape_points(shape, kb, roto_node=roto_node)
 
             # 2a. Forward tracking from ka to kb
-            q_fwd = [{"index": p["index"], "t": 0.0, "x": float(p["x"]), "y": float(p["y"])} for p in pts_ka]
+            q_fwd, _ = _build_combined_queries(bridge, roto_node, shapes, ka, 0.0)
             cb_fwd = make_pass_callback(f"Interval {ka}➔{kb} (Forward)")
             pass_counter[0] += 1
             fwd_tracks = tracker_core.run_cotracker_point_tracking(
@@ -1812,7 +1970,7 @@ def _run_multi_reference_tracking(roto_node, ref_frames: List[int], start_f: int
             )
 
             # 2b. Backward tracking from kb to ka
-            q_bwd = [{"index": p["index"], "t": float(kb - ka), "x": float(p["x"]), "y": float(p["y"])} for p in pts_kb]
+            q_bwd, _ = _build_combined_queries(bridge, roto_node, shapes, kb, float(kb - ka))
             cb_bwd = make_pass_callback(f"Interval {ka}➔{kb} (Backward)")
             pass_counter[0] += 1
             bwd_tracks = tracker_core.run_cotracker_point_tracking(
@@ -1837,8 +1995,7 @@ def _run_multi_reference_tracking(roto_node, ref_frames: List[int], start_f: int
         if max_needed > ref_frames[-1]:
             km = ref_frames[-1]
             sub_paths = image_paths[km - min_needed : max_needed - min_needed + 1]
-            pts_km = bridge.extract_shape_points(shape, km, roto_node=roto_node)
-            queries = [{"index": p["index"], "t": 0.0, "x": float(p["x"]), "y": float(p["y"])} for p in pts_km]
+            queries, _ = _build_combined_queries(bridge, roto_node, shapes, km, 0.0)
             cb_post = make_pass_callback(f"Post-range ({km} ➔ {max_needed})")
             pass_counter[0] += 1
 
@@ -1868,24 +2025,36 @@ def _run_multi_reference_tracking(roto_node, ref_frames: List[int], start_f: int
         key_step = int(roto_node['ar_key_step'].value()) if roto_node.knob('ar_key_step') else 1
         key_step = max(1, key_step)
 
-        ok = bridge.bake_multi_ref_tracking_data_to_roto(
-            roto_node=roto_node,
-            raw_shape=shape,
-            tracking_data=master_tracks,
-            user_ref_frames=set(ref_frames),
-            keep_tangents=keep_tg,
-            key_step=key_step
-        )
+        # Split combined tracks and bake each shape independently into its own curves
+        per_shape_tracks = _split_tracks_by_shape(master_tracks, index_map, len(shapes))
+        baked = []
+        for shape, shape_tracks in zip(shapes, per_shape_tracks):
+            if shape_tracks and bridge.bake_multi_ref_tracking_data_to_roto(
+                roto_node=roto_node,
+                raw_shape=shape,
+                tracking_data=shape_tracks,
+                user_ref_frames=set(ref_frames),
+                keep_tangents=keep_tg,
+                key_step=key_step
+            ):
+                baked.append(shape)
 
         progress.setProgress(100)
-        if ok:
+        if baked:
             step_info = f" (Key Step: {key_step})" if key_step > 1 else ""
             res_info = f" [{max_size}p]" if max_size > 0 else " [Full Res]"
             ref_str = ", ".join(str(k) for k in ref_frames)
-            msg = f"✓ Multi-Reference Tracked {len(pts_info)} pts across {len(ref_frames)} keys [{ref_str}]{step_info}{res_info}!"
+            summary = (f"✓ Multi-Reference Tracked {num_pts} pts in {len(baked)} shape(s) [{_shape_names(baked)}] "
+                       f"across {len(ref_frames)} keys [{ref_str}]{step_info}{res_info}!")
             if roto_node.knob('ar_status'):
-                roto_node.knob('ar_status').setValue(msg)
-            nuke.message(f"AutoRoto: Complete!\nMulti-Reference tracking baked across {len(ref_frames)} anchor keyframes ({min_needed}-{max_needed}).\nUser keyframes [{ref_str}] 100% preserved.")
+                roto_node.knob('ar_status').setValue(summary)
+            if notify:
+                nuke.message(
+                    f"AutoRoto: Complete!\n"
+                    f"{len(baked)} shape(s) tracked independently: {_shape_names(baked)}\n"
+                    f"Multi-Reference tracking baked across {len(ref_frames)} anchor keyframes ({min_needed}-{max_needed}).\n"
+                    f"User keyframes [{ref_str}] 100% preserved."
+                )
         else:
             if roto_node.knob('ar_status'):
                 roto_node.knob('ar_status').setValue("Multi-Reference bake failed.")
@@ -1905,6 +2074,8 @@ def _run_multi_reference_tracking(roto_node, ref_frames: List[int], start_f: int
         del progress
         if temp_dir and os.path.exists(temp_dir):
             shutil.rmtree(temp_dir, ignore_errors=True)
+
+    return summary
 
 
 # Automatically apply tab move & VCR button sizing if Nuke GUI session is active
