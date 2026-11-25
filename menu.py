@@ -40,26 +40,3 @@ if draw_menu:
         'import nuke_bridge; nuke_bridge.create_autoroto_node()',
         icon='Roto.png'
     )
-
-# 3. Add to Main Menu Bar
-main_menubar = nuke.menu('Nuke')
-top_menu = main_menubar.addMenu('&AutoRoto')
-top_menu.addCommand(
-    'Create AutoRoto Node (Tracker Buttons)',
-    'import nuke_bridge; nuke_bridge.create_autoroto_node()',
-    shortcut='Ctrl+Alt+R'
-)
-top_menu.addCommand(
-    'Convert Selected Roto to AutoRoto',
-    'import nuke_bridge; nuke_bridge.add_autoroto_to_selected()'
-)
-top_menu.addSeparator()
-top_menu.addCommand(
-    'Check CoTracker GPU Status',
-    'import nuke_bridge; nuke_bridge.on_node_check_gpu()'
-)
-top_menu.addSeparator()
-top_menu.addCommand(
-    'About AutoRoto',
-    """import nuke; nuke.message("AutoRoto v2.1 (Tracker Buttons on Roto)\\n\\nNative Nuke Roto Node equipped with Tracker-style VCR buttons & CoTracker3 GPU backend.\\n\\n• Draw shapes natively in Nuke Viewer\\n• VCR Tracker buttons: |◀, ◀, ▶, ▶|, Track Range\\n• Zero-drift bidirectional tracking")"""
-)
